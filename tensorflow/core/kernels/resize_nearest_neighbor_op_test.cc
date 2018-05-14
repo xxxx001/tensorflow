@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ limitations under the License.
 // Image Library.
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/framework/fake_input.h"
-#include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -35,7 +34,6 @@ namespace tensorflow {
 class ResizeNearestNeighborOpTest : public OpsTestBase {
  protected:
   ResizeNearestNeighborOpTest() {
-    RequireDefaultOps();
     TF_EXPECT_OK(NodeDefBuilder("resize_nn", "ResizeNearestNeighbor")
                      .Input(FakeInput(DT_FLOAT))
                      .Input(FakeInput(DT_INT32))
@@ -48,7 +46,6 @@ class ResizeNearestNeighborOpTest : public OpsTestBase {
 class ResizeNearestNeighborOpAlignCornersTest : public OpsTestBase {
  protected:
   ResizeNearestNeighborOpAlignCornersTest() {
-    RequireDefaultOps();
     TF_EXPECT_OK(NodeDefBuilder("resize_nn", "ResizeNearestNeighbor")
                      .Input(FakeInput(DT_FLOAT))
                      .Input(FakeInput(DT_INT32))
@@ -126,9 +123,9 @@ TEST_F(ResizeNearestNeighborOpAlignCornersTest,
 
   // clang-format off
   test::FillValues<float>(&expected,
-    {1, 1, 2,
-     1, 1, 2,
-     3, 3, 4});
+    {1, 2, 2,
+     3, 4, 4,
+     3, 4, 4});
 
   // clang-format on
   test::ExpectTensorEqual<float>(expected, *GetOutput(0));
@@ -237,9 +234,9 @@ TEST_F(ResizeNearestNeighborOpAlignCornersTest,
 
   // clang-format off
   test::FillValues<float>(&expected,
-    { 1,  2,  4,
-      5,  6,  8,
-     13, 14, 16});
+    { 1,  3,  4,
+      9, 11, 12,
+     13, 15, 16});
 
   // clang-format on
   test::ExpectTensorEqual<float>(expected, *GetOutput(0));

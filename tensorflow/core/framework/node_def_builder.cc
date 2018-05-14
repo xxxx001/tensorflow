@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,28 +16,42 @@ limitations under the License.
 #include "tensorflow/core/framework/node_def_builder.h"
 
 #include <vector>
+#include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/op_def_util.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 
 namespace tensorflow {
 
-NodeDefBuilder::NodeDefBuilder(const string& name, const string& op_name,
+NodeDefBuilder::NodeOut::NodeOut(StringPiece n, int i, DataType dt)
+    : node(std::string(n)), index(i), data_type(dt) {}
+
+NodeDefBuilder::NodeOut::NodeOut() {
+  // uninitialized, call Reset() before use.
+}
+
+void NodeDefBuilder::NodeOut::Reset(StringPiece n, int i, DataType dt) {
+  node = std::string(n);
+  index = i;
+  data_type = dt;
+}
+
+NodeDefBuilder::NodeDefBuilder(StringPiece name, StringPiece op_name,
                                const OpRegistryInterface* op_registry) {
-  node_def_.set_name(name);
-  Status status;
-  op_def_ = op_registry->LookUp(op_name, &status);
-  if (op_def_ == nullptr) {
+  node_def_.set_name(std::string(name));
+  const Status status =
+      op_registry->LookUpOpDef(std::string(op_name), &op_def_);
+  if (status.ok()) {
+    Initialize();
+  } else {
     errors_.push_back(status.error_message());
     inputs_specified_ = 0;
-  } else {
-    Initialize();
   }
 }
 
-NodeDefBuilder::NodeDefBuilder(const string& name, const OpDef* op_def)
+NodeDefBuilder::NodeDefBuilder(StringPiece name, const OpDef* op_def)
     : op_def_(op_def) {
-  node_def_.set_name(name);
+  node_def_.set_name(std::string(name));
   Initialize();
 }
 
@@ -71,8 +85,27 @@ NodeDefBuilder& NodeDefBuilder::Input(FakeInputFunctor fake_input) {
   return *this;
 }
 
+NodeDefBuilder& NodeDefBuilder::Input(StringPiece src_node, int src_index,
+                                      DataType dt) {
+  const OpDef::ArgDef* arg = NextArgDef();
+  if (arg != nullptr) SingleInput(arg, src_node, src_index, dt);
+  return *this;
+}
+
+NodeDefBuilder& NodeDefBuilder::Input(const NodeOut& src) {
+  Input(src.node, src.index, src.data_type);
+  return *this;
+}
+
+// For inputs that take a list of tensors.
+NodeDefBuilder& NodeDefBuilder::Input(gtl::ArraySlice<NodeOut> src_list) {
+  const OpDef::ArgDef* arg = NextArgDef();
+  if (arg != nullptr) ListInput(arg, src_list);
+  return *this;
+}
+
 void NodeDefBuilder::SingleInput(const OpDef::ArgDef* input_arg,
-                                 const string& src_node, int src_index,
+                                 StringPiece src_node, int src_index,
                                  DataType dt) {
   AddInput(src_node, src_index);
 
@@ -129,7 +162,7 @@ void NodeDefBuilder::ListInput(const OpDef::ArgDef* input_arg,
   }
 }
 
-void NodeDefBuilder::AddInput(const string& src_node, int src_index) {
+void NodeDefBuilder::AddInput(StringPiece src_node, int src_index) {
   if (src_node.empty()) {
     errors_.push_back("Empty input node name");
   } else if (src_node[0] == '^') {
@@ -138,7 +171,7 @@ void NodeDefBuilder::AddInput(const string& src_node, int src_index) {
   } else if (src_index > 0) {
     node_def_.add_input(strings::StrCat(src_node, ":", src_index));
   } else {
-    node_def_.add_input(src_node);
+    node_def_.add_input(std::string(src_node));
   }
 }
 
@@ -158,6 +191,16 @@ void NodeDefBuilder::VerifyInputRef(const OpDef::ArgDef* input_arg,
                                       DataTypeString(dt),
                                       " expected ref type"));
   }
+}
+
+NodeDefBuilder& NodeDefBuilder::ControlInput(StringPiece src_node) {
+  control_inputs_.push_back(std::string(src_node));
+  return *this;
+}
+
+NodeDefBuilder& NodeDefBuilder::Device(StringPiece device_spec) {
+  node_def_.set_device(std::string(device_spec));
+  return *this;
 }
 
 Status NodeDefBuilder::Finalize(NodeDef* node_def) const {
@@ -205,5 +248,52 @@ Status NodeDefBuilder::Finalize(NodeDef* node_def) const {
     return Status::OK();
   }
 }
+
+NodeDefBuilder& NodeDefBuilder::Attr(StringPiece name, const AttrValue& value) {
+  if (const AttrValue* found = AttrSlice(node_def_).Find(name)) {
+    if (!AreAttrValuesEqual(*found, value)) {
+      errors_.push_back(strings::StrCat("Inconsistent values for attr '", name,
+                                        "' ", SummarizeAttrValue(*found),
+                                        " vs. ", SummarizeAttrValue(value)));
+    }
+  } else {
+    AddNodeAttr(name, value, &node_def_);
+  }
+  return *this;
+}
+
+#define ATTR(T)                                                     \
+  NodeDefBuilder& NodeDefBuilder::Attr(StringPiece name, T value) { \
+    AttrValue attr_value;                                           \
+    SetAttrValue(value, &attr_value);                               \
+    return Attr(name, attr_value);                                  \
+  }
+ATTR(StringPiece)
+ATTR(const char*)
+ATTR(int32)
+ATTR(int64)
+ATTR(float)
+ATTR(double)
+ATTR(bool)
+ATTR(DataType)
+ATTR(const PartialTensorShape&)
+ATTR(const Tensor&)
+ATTR(const TensorProto&)
+ATTR(const NameAttrList&)
+ATTR(gtl::ArraySlice<StringPiece>)
+ATTR(gtl::ArraySlice<const char*>)
+ATTR(gtl::ArraySlice<string>)
+ATTR(gtl::ArraySlice<int32>)
+ATTR(gtl::ArraySlice<int64>)
+ATTR(gtl::ArraySlice<float>)
+ATTR(gtl::ArraySlice<bool>)
+ATTR(const std::vector<bool>&)
+ATTR(gtl::ArraySlice<DataType>)
+ATTR(gtl::ArraySlice<TensorShape>)
+ATTR(gtl::ArraySlice<PartialTensorShape>)
+ATTR(gtl::ArraySlice<TensorShapeProto>)
+ATTR(gtl::ArraySlice<Tensor>)
+ATTR(gtl::ArraySlice<NameAttrList>)
+#undef ATTR
 
 }  // namespace tensorflow

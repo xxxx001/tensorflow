@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,8 +19,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/lib/stringprintf.h"
 #include "tensorflow/stream_executor/multi_platform_manager.h"
 
-namespace perftools {
-namespace gputools {
+namespace stream_executor {
 
 const PluginId kNullPlugin = nullptr;
 
@@ -44,13 +43,17 @@ string PluginKindString(PluginKind plugin_kind) {
 PluginRegistry::DefaultFactories::DefaultFactories() :
     blas(kNullPlugin), dnn(kNullPlugin), fft(kNullPlugin), rng(kNullPlugin) { }
 
-/* static */ mutex PluginRegistry::mu_(LINKER_INITIALIZED);
+static mutex& GetPluginRegistryMutex() {
+  static mutex* mu = new mutex;
+  return *mu;
+}
+
 /* static */ PluginRegistry* PluginRegistry::instance_ = nullptr;
 
 PluginRegistry::PluginRegistry() {}
 
 /* static */ PluginRegistry* PluginRegistry::Instance() {
-  mutex_lock lock{mu_};
+  mutex_lock lock{GetPluginRegistryMutex()};
   if (instance_ == nullptr) {
     instance_ = new PluginRegistry();
   }
@@ -66,7 +69,7 @@ template <typename FACTORY_TYPE>
 port::Status PluginRegistry::RegisterFactoryInternal(
     PluginId plugin_id, const string& plugin_name, FACTORY_TYPE factory,
     std::map<PluginId, FACTORY_TYPE>* factories) {
-  mutex_lock lock{mu_};
+  mutex_lock lock{GetPluginRegistryMutex()};
 
   if (factories->find(plugin_id) != factories->end()) {
     return port::Status{
@@ -240,5 +243,4 @@ EMIT_PLUGIN_SPECIALIZATIONS(DnnFactory, dnn, "DNN");
 EMIT_PLUGIN_SPECIALIZATIONS(FftFactory, fft, "FFT");
 EMIT_PLUGIN_SPECIALIZATIONS(RngFactory, rng, "RNG");
 
-}  // namespace gputools
-}  // namespace perftools
+}  // namespace stream_executor

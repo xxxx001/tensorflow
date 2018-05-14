@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,16 @@ limitations under the License.
 #define TENSORFLOW_COMMON_RUNTIME_GPU_PROCESS_STATE_H_
 
 #include <functional>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
+#include "tensorflow/core/common_runtime/gpu/gpu_id.h"
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/thread_annotations.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 
 namespace tensorflow {
 
@@ -53,14 +56,17 @@ class ProcessState {
     string DebugString();
   };
 
-  // Records the number of GPUs available in the local process.
-  // It is a fatal error to call this with a value != to the value
-  // in a prior call.
-  void SetGPUCount(int c);
+  // Query whether any GPU device has been created so far.
+  // Disable thread safety analysis since a race is benign here.
+  bool HasGPUDevice() const NO_THREAD_SAFETY_ANALYSIS {
+    return gpu_device_enabled_;
+  }
 
-  // Returns number of GPUs available in local process, as set by
-  // SetGPUCount();  Returns 0 if SetGPUCount has not been called.
-  int GPUCount() const;
+  // Set the flag to indicate a GPU device has been created.
+  // Disable thread safety analysis since a race is benign here.
+  void EnableGPUDevice() NO_THREAD_SAFETY_ANALYSIS {
+    gpu_device_enabled_ = true;
+  }
 
   // Returns what we know about the memory at ptr.
   // If we know nothing, it's called CPU 0 with no other attributes.
@@ -76,19 +82,19 @@ class ProcessState {
   //
   // 'total_bytes' is the total number of bytes that should be made
   // available to the allocator.  The first call to this function for
-  // a given gpu_id creates the allocator, so only the total_bytes
+  // a given tf_gpu_id creates the allocator, so only the total_bytes
   // used on that first call is used.
   //
   // "Allocator type" describes the type of algorithm to use for the
   // underlying allocator.  REQUIRES: Must be a valid type (see
   // config.proto for the list of supported strings.).
   //
-  // REQUIRES: gpu_id must be a valid ordinal for a GPU available in the
+  // REQUIRES: tf_gpu_id must be a valid id for a BaseGPUDevice available in the
   // current system environment.  Otherwise returns nullptr.
-  Allocator* GetGPUAllocator(int gpu_id, size_t total_bytes,
-                             const string& allocator_type);
+  virtual Allocator* GetGPUAllocator(const GPUOptions& options,
+                                     TfGpuId tf_gpu_id, size_t total_bytes);
 
-  Allocator* GetCUDAHostAllocator(int numa_node);
+  virtual Allocator* GetCUDAHostAllocator(int numa_node);
 
   // Registers a function to be called once on every new Region
   // allocated by every GPURegionAllocator proximate to the specified
@@ -101,22 +107,26 @@ class ProcessState {
   // the index of one of the PCIe buses.  If the bus_id is invalid,
   // results are undefined.
   typedef std::function<void(void*, size_t)> AllocVisitor;
-  void AddGPUAllocVisitor(int bus_id, AllocVisitor visitor);
+  virtual void AddGPUAllocVisitor(int bus_id, AllocVisitor visitor);
 
   typedef std::unordered_map<const void*, MemDesc> MDMap;
 
  protected:
   ProcessState();
 
+  // Helper method for unit tests to reset the ProcessState singleton by
+  // cleaning up everything. Never use in production.
+  virtual void TestOnlyReset();
+
   static ProcessState* instance_;
+  bool gpu_device_enabled_;
 
   mutex mu_;
-  int gpu_count_;
 
-  std::vector<PoolAllocator*> cpu_allocators_ GUARDED_BY(mu_);
+  std::vector<Allocator*> cpu_allocators_ GUARDED_BY(mu_);
   std::vector<VisitableAllocator*> gpu_allocators_ GUARDED_BY(mu_);
   std::vector<std::vector<AllocVisitor>> gpu_visitors_ GUARDED_BY(mu_);
-  std::vector<PoolAllocator*> cuda_host_allocators_ GUARDED_BY(mu_);
+  std::vector<Allocator*> cuda_host_allocators_ GUARDED_BY(mu_);
 
   virtual ~ProcessState();
 
@@ -126,6 +136,8 @@ class ProcessState {
   std::vector<Allocator*> cpu_al_ GUARDED_BY(mu_);
   std::vector<Allocator*> gpu_al_ GUARDED_BY(mu_);
   std::vector<Allocator*> cuda_al_ GUARDED_BY(mu_);
+
+  friend class GPUDeviceTest;
 };
 
 namespace internal {
@@ -149,8 +161,10 @@ class RecordingAllocator : public Allocator {
     a_->DeallocateRaw(p);
   }
   bool TracksAllocationSizes() override { return a_->TracksAllocationSizes(); }
-  size_t RequestedSize(void* p) override { return a_->RequestedSize(p); }
-  size_t AllocatedSize(void* p) override { return a_->AllocatedSize(p); }
+  size_t RequestedSize(const void* p) override { return a_->RequestedSize(p); }
+  size_t AllocatedSize(const void* p) override { return a_->AllocatedSize(p); }
+  void GetStats(AllocatorStats* stats) override { a_->GetStats(stats); }
+  void ClearStats() override { a_->ClearStats(); }
   ProcessState::MDMap* mm_;  // not owned
   Allocator* a_;             // not owned
   ProcessState::MemDesc md_;

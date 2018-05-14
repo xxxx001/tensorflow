@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@ limitations under the License.
 
 #include "tensorflow/core/framework/node_def_util.h"
 
+#include "tensorflow/core/framework/attr_value.pb.h"  // NOLINT
 #include "tensorflow/core/framework/fake_input.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op_def_builder.h"
 #include "tensorflow/core/framework/op_def_util.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
+#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/platform/test.h"
 
@@ -28,9 +30,9 @@ namespace tensorflow {
 namespace {
 
 OpDef ToOpDef(const OpDefBuilder& builder) {
-  OpDef op_def;
-  TF_EXPECT_OK(builder.Finalize(&op_def));
-  return op_def;
+  OpRegistrationData op_reg_data;
+  TF_EXPECT_OK(builder.Finalize(&op_reg_data));
+  return op_reg_data.op_def;
 }
 
 NodeDef ToNodeDef(const string& text) {
@@ -64,7 +66,7 @@ void ExpectFailure(const NodeDef& bad, const OpDef& op_def,
       << "; OpDef: " << SummarizeOpDef(op_def);
 
   LOG(INFO) << "Message: " << status.error_message();
-  EXPECT_TRUE(StringPiece(status.ToString()).contains(message))
+  EXPECT_TRUE(str_util::StrContains(status.ToString(), message))
       << "NodeDef: " << SummarizeNodeDef(bad)
       << "; OpDef: " << SummarizeOpDef(op_def) << "\nActual error: " << status
       << "\nDoes not contain: " << message;
@@ -150,8 +152,9 @@ TEST(NodeDefUtilTest, Out) {
   AddNodeAttr("T", DT_STRING, &bad);
   ExpectFailure(bad, op,
                 "Value for attr 'T' of string is not in the list of allowed "
-                "values: float, double, int64, int32, uint8, uint16, int16, "
-                "int8, complex64, qint8, quint8, qint32");
+                "values: float, double, int32, uint8, int16, int8, complex64, "
+                "int64, qint8, quint8, qint32, bfloat16, uint16, complex128, "
+                "half, uint32, uint64");
 }
 
 TEST(NodeDefUtilTest, Enum) {
@@ -263,7 +266,7 @@ void ExpectInvalidSyntax(const NodeDef& bad, const string& message) {
   EXPECT_TRUE(errors::IsInvalidArgument(status))
       << status << "; NodeDef: " << SummarizeNodeDef(bad);
 
-  EXPECT_TRUE(StringPiece(status.ToString()).contains(message))
+  EXPECT_TRUE(str_util::StrContains(StringPiece(status.ToString()), message))
       << "NodeDef: " << SummarizeNodeDef(bad) << ", " << status << ", "
       << message;
 }
@@ -308,12 +311,24 @@ TEST(NodeDefUtilTest, ValidSyntax) {
     )proto");
   ExpectInvalidSyntax(node_def_internal_name, "Illegal op name '_n'");
 
+  const NodeDef node_def_slash_in_name = ToNodeDef(R"proto(
+    name:'n\\' op:'AnyIn' input:'a' input:'b'
+    attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
+    )proto");
+  ExpectInvalidSyntax(node_def_slash_in_name, "Illegal op name 'n\\'");
+
   const NodeDef node_def_internal_input_name = ToNodeDef(R"proto(
     name:'n' op:'AnyIn' input:'_a' input:'b'
     attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
     )proto");
   ExpectInvalidSyntax(node_def_internal_input_name,
                       "Illegal op input name '_a'");
+
+  const NodeDef node_def_input_name_slash = ToNodeDef(R"proto(
+    name:'n' op:'AnyIn' input:'a\\' input:'b'
+    attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
+    )proto");
+  ExpectInvalidSyntax(node_def_input_name_slash, "Illegal op input name 'a\\'");
 
   const NodeDef node_def_invalid_control_input_name = ToNodeDef(R"proto(
     name:'n' op:'AnyIn' input:'a' input:'^b:0'
@@ -322,12 +337,33 @@ TEST(NodeDefUtilTest, ValidSyntax) {
   ExpectInvalidSyntax(node_def_invalid_control_input_name,
                       "Illegal op input name '^b:0'");
 
+  const NodeDef node_def_control_input_name_slash = ToNodeDef(R"proto(
+    name:'n' op:'AnyIn' input:'a' input:'^b\\'
+    attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
+    )proto");
+  ExpectInvalidSyntax(node_def_control_input_name_slash,
+                      "Illegal op input name '^b\\'");
+
   const NodeDef node_def_data_input_after_control = ToNodeDef(R"proto(
     name:'n' op:'AnyIn' input:'^a' input:'b'
     attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
     )proto");
   ExpectInvalidSyntax(node_def_data_input_after_control,
                       "All control inputs must follow all data inputs");
+
+  const NodeDef node_def_data_input_invalid_port = ToNodeDef(R"proto(
+    name:'n' op:'AnyIn' input:'a:b' input:'b'
+    attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
+    )proto");
+  ExpectInvalidSyntax(node_def_data_input_invalid_port,
+                      "Illegal op input name 'a:b");
+
+  const NodeDef node_def_data_input_invalid_port2 = ToNodeDef(R"proto(
+    name:'n' op:'AnyIn' input:'a:00' input:'b'
+    attr { key:'T' value { list { type: [DT_INT32, DT_STRING] } } }
+    )proto");
+  ExpectInvalidSyntax(node_def_data_input_invalid_port2,
+                      "Illegal op input name 'a:00");
 }
 
 TEST(NameRangesForNodeTest, Simple) {

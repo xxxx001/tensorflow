@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,13 +22,17 @@ import collections
 
 import six
 
+from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import constant_op
+from tensorflow.python.ops import gen_array_ops
+from tensorflow.python.ops import gen_nn_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.util.tf_export import tf_export
 
 
+@tf_export("clip_by_value")
 def clip_by_value(t, clip_value_min, clip_value_max,
                   name=None):
   """Clips tensor values to a specified min and max.
@@ -40,37 +44,83 @@ def clip_by_value(t, clip_value_min, clip_value_max,
 
   Args:
     t: A `Tensor`.
-    clip_value_min: A 0-D (scalar) `Tensor`. The minimum value to clip by.
-    clip_value_max: A 0-D (scalar) `Tensor`. The maximum value to clip by.
+    clip_value_min: A 0-D (scalar) `Tensor`, or a `Tensor` with the same shape
+      as `t`. The minimum value to clip by.
+    clip_value_max: A 0-D (scalar) `Tensor`, or a `Tensor` with the same shape
+      as `t`. The maximum value to clip by.
     name: A name for the operation (optional).
 
   Returns:
     A clipped `Tensor`.
+
+  Raises:
+    ValueError: if the clip tensors would trigger array broadcasting
+      that would make the returned tensor larger than the input.
   """
-  with ops.op_scope([t, clip_value_min, clip_value_max], name,
-                   "clip_by_value") as name:
+  with ops.name_scope(name, "clip_by_value",
+                      [t, clip_value_min, clip_value_max]) as name:
     t = ops.convert_to_tensor(t, name="t")
 
     # Go through list of tensors, for each value in each tensor clip
     t_min = math_ops.minimum(t, clip_value_max)
+    # Assert that the shape is compatible with the initial shape,
+    # to prevent unintentional broadcasting.
+    _ = t.shape.merge_with(t_min.shape)
+
     t_max = math_ops.maximum(t_min, clip_value_min, name=name)
+    _ = t.shape.merge_with(t_max.shape)
 
   return t_max
+  # TODO(scottzhu): switch to use new implmentation in 2 weeks.
+    # return gen_math_ops.clip_by_value(
+    #     t, clip_value_min, clip_value_max, name=name)
 
 
-def clip_by_norm(t, clip_norm, name=None):
+# TODO(scottzhu): switch to use new implmentation in 2 weeks.
+# @ops.RegisterGradient("ClipByValue")
+def _clip_by_value_grad(op, grad):
+  """Returns grad of clip_by_value."""
+  x = op.inputs[0]
+  y = op.inputs[1]
+  z = op.inputs[2]
+  gdtype = grad.dtype
+  sx = array_ops.shape(x)
+  sy = array_ops.shape(y)
+  sz = array_ops.shape(z)
+  gradshape = array_ops.shape(grad)
+  zeros = array_ops.zeros(gradshape, gdtype)
+  xymask = math_ops.less(x, y)
+  xzmask = math_ops.greater(x, z)
+  rx, ry = gen_array_ops.broadcast_gradient_args(sx, sy)
+  rx, rz = gen_array_ops.broadcast_gradient_args(sx, sz)
+  xgrad = array_ops.where(math_ops.logical_or(xymask, xzmask), zeros, grad)
+  ygrad = array_ops.where(xymask, grad, zeros)
+  zgrad = array_ops.where(xzmask, grad, zeros)
+  gx = array_ops.reshape(math_ops.reduce_sum(xgrad, rx), sx)
+  gy = array_ops.reshape(math_ops.reduce_sum(ygrad, ry), sy)
+  gz = array_ops.reshape(math_ops.reduce_sum(zgrad, rz), sz)
+  return (gx, gy, gz)
+
+
+@tf_export("clip_by_norm")
+def clip_by_norm(t, clip_norm, axes=None, name=None):
   """Clips tensor values to a maximum L2-norm.
 
   Given a tensor `t`, and a maximum clip value `clip_norm`, this operation
-  normalizes `t` so that its L2-norm is less than or equal to `clip_norm`.
-  Specifically, if the L2-norm is already less than or equal to `clip_norm`,
-  then `t` is not modified. If the L2-norm is greater than `clip_norm`, then
-  this operation returns a tensor of the same type and shape as `t` with its
-  values set to:
+  normalizes `t` so that its L2-norm is less than or equal to `clip_norm`,
+  along the dimensions given in `axes`. Specifically, in the default case
+  where all dimensions are used for calculation, if the L2-norm of `t` is
+  already less than or equal to `clip_norm`, then `t` is not modified. If
+  the L2-norm is greater than `clip_norm`, then this operation returns a
+  tensor of the same type and shape as `t` with its values set to:
 
   `t * clip_norm / l2norm(t)`
 
   In this case, the L2-norm of the output tensor is `clip_norm`.
+
+  As another example, if `t` is a matrix and `axes == [1]`, then each row
+  of the output will have L2-norm equal to `clip_norm`. If `axes == [0]`
+  instead, each column of the output will be clipped.
 
   This operation is typically used to clip gradients before applying them with
   an optimizer.
@@ -78,22 +128,30 @@ def clip_by_norm(t, clip_norm, name=None):
   Args:
     t: A `Tensor`.
     clip_norm: A 0-D (scalar) `Tensor` > 0. A maximum clipping value.
+    axes: A 1-D (vector) `Tensor` of type int32 containing the dimensions
+      to use for computing the L2-norm. If `None` (the default), uses all
+      dimensions.
     name: A name for the operation (optional).
 
   Returns:
     A clipped `Tensor`.
   """
-  with ops.op_scope([t, clip_norm], name, "clip_by_norm") as name:
+  with ops.name_scope(name, "clip_by_norm", [t, clip_norm]) as name:
     t = ops.convert_to_tensor(t, name="t")
 
     # Calculate L2-norm, clip elements by ratio of clip_norm to L2-norm
-    l2norm_inv = math_ops.rsqrt(
-        math_ops.reduce_sum(t * t, math_ops.range(array_ops.rank(t))))
-    tclip = array_ops.identity(t * clip_norm * math_ops.minimum(
-        l2norm_inv, constant_op.constant(1.0 / clip_norm)), name=name)
+    l2norm = math_ops.sqrt(math_ops.reduce_sum(t * t, axes, keepdims=True))
+    intermediate = t * clip_norm
+    # Assert that the shape is compatible with the initial shape,
+    # to prevent unintentional broadcasting.
+    _ = t.shape.merge_with(intermediate.shape)
+    tclip = array_ops.identity(
+        intermediate / math_ops.maximum(l2norm, clip_norm), name=name)
 
   return tclip
 
+
+@tf_export("global_norm")
 def global_norm(t_list, name=None):
   """Computes the global norm of multiple tensors.
 
@@ -119,21 +177,30 @@ def global_norm(t_list, name=None):
       or isinstance(t_list, six.string_types)):
     raise TypeError("t_list should be a sequence")
   t_list = list(t_list)
-  with ops.op_scope(t_list, name, "global_norm") as name:
+  with ops.name_scope(name, "global_norm", t_list) as name:
     values = [
         ops.convert_to_tensor(
             t.values if isinstance(t, ops.IndexedSlices) else t,
             name="t_%d" % i)
         if t is not None else t
         for i, t in enumerate(t_list)]
-    squared_norms = array_ops.pack(
-        [math_ops.reduce_sum(v * v) for v in values if v])
+    half_squared_norms = []
+    for v in values:
+      if v is not None:
+        with ops.colocate_with(v):
+          half_squared_norms.append(gen_nn_ops.l2_loss(v))
+
+    half_squared_norm = math_ops.reduce_sum(array_ops.stack(half_squared_norms))
 
     norm = math_ops.sqrt(
-        math_ops.reduce_sum(squared_norms), name="global_norm")
+        half_squared_norm *
+        constant_op.constant(2.0, dtype=half_squared_norm.dtype),
+        name="global_norm")
 
   return norm
 
+
+@tf_export("clip_by_global_norm")
 def clip_by_global_norm(t_list, clip_norm, use_norm=None, name=None):
   """Clips values of multiple tensors by the ratio of the sum of their norms.
 
@@ -157,8 +224,8 @@ def clip_by_global_norm(t_list, clip_norm, use_norm=None, name=None):
   Any of the entries of `t_list` that are of type `None` are ignored.
 
   This is the correct way to perform gradient clipping (for example, see
-  R. Pascanu, T. Mikolov, and Y. Bengio, "On the difficulty of training
-  Recurrent Neural Networks".  http://arxiv.org/abs/1211.5063)
+  [Pascanu et al., 2012](http://arxiv.org/abs/1211.5063)
+  ([pdf](http://arxiv.org/pdf/1211.5063.pdf))).
 
   However, it is slower than `clip_by_norm()` because all the parameters must be
   ready before the clipping operation can be performed.
@@ -184,11 +251,12 @@ def clip_by_global_norm(t_list, clip_norm, use_norm=None, name=None):
   if use_norm is None:
     use_norm = global_norm(t_list, name)
 
-  with ops.op_scope(t_list + [clip_norm], name, "clip_by_global_norm") as name:
+  with ops.name_scope(name, "clip_by_global_norm",
+                      t_list + [clip_norm]) as name:
     # Calculate L2-norm, clip elements by ratio of clip_norm to L2-norm
     scale = clip_norm * math_ops.minimum(
         1.0 / use_norm,
-        constant_op.constant(1.0 / clip_norm, dtype=use_norm.dtype))
+        constant_op.constant(1.0, dtype=use_norm.dtype) / clip_norm)
 
     values = [
         ops.convert_to_tensor(
@@ -197,13 +265,17 @@ def clip_by_global_norm(t_list, clip_norm, use_norm=None, name=None):
         if t is not None else t
         for i, t in enumerate(t_list)]
 
-    values_clipped = [
-        array_ops.identity(v * scale, name="%s_%d" % (name, i))
-        if v is not None else None
-        for i, v in enumerate(values)]
+    values_clipped = []
+    for i, v in enumerate(values):
+      if v is None:
+        values_clipped.append(None)
+      else:
+        with ops.colocate_with(v):
+          values_clipped.append(
+              array_ops.identity(v * scale, name="%s_%d" % (name, i)))
 
     list_clipped = [
-        ops.IndexedSlices(c_v, t.indices)
+        ops.IndexedSlices(c_v, t.indices, t.dense_shape)
         if isinstance(t, ops.IndexedSlices)
         else c_v
         for (c_v, t) in zip(values_clipped, t_list)]
@@ -211,6 +283,7 @@ def clip_by_global_norm(t_list, clip_norm, use_norm=None, name=None):
   return list_clipped, use_norm
 
 
+@tf_export("clip_by_average_norm")
 def clip_by_average_norm(t, clip_norm, name=None):
   """Clips tensor values to a maximum average L2-norm.
 
@@ -236,7 +309,7 @@ def clip_by_average_norm(t, clip_norm, name=None):
   Returns:
     A clipped `Tensor`.
   """
-  with ops.op_scope([t, clip_norm], name, "clip_by_average_norm") as name:
+  with ops.name_scope(name, "clip_by_average_norm", [t, clip_norm]) as name:
     t = ops.convert_to_tensor(t, name="t")
 
     # Calculate L2-norm per element, clip elements by ratio of clip_norm to
@@ -246,7 +319,7 @@ def clip_by_average_norm(t, clip_norm, name=None):
         math_ops.reduce_sum(t * t, math_ops.range(array_ops.rank(t))))
     tclip = array_ops.identity(
         t * clip_norm * math_ops.minimum(
-            l2norm_inv * n_element, constant_op.constant(1.0 / clip_norm)),
+            l2norm_inv * n_element, constant_op.constant(1.0) / clip_norm),
         name=name)
 
   return tclip

@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,18 +15,19 @@ limitations under the License.
 
 #include "tensorflow/core/common_runtime/gpu/gpu_event_mgr.h"
 
-#include "tensorflow/core/framework/config.pb.h"
 #include "tensorflow/core/platform/stream_executor.h"
-
-namespace gpu = ::perftools::gputools;
+#include "tensorflow/core/protobuf/config.pb.h"
 
 namespace tensorflow {
 
-EventMgr::EventMgr(gpu::StreamExecutor* se, const GPUOptions& gpu_options)
+EventMgr::EventMgr(se::StreamExecutor* se, const GPUOptions& gpu_options)
     : exec_(se),
       deferred_bytes_threshold_(gpu_options.deferred_deletion_bytes()
                                     ? gpu_options.deferred_deletion_bytes()
                                     : 8 * 1048576),
+      polling_active_delay_usecs_(gpu_options.polling_active_delay_usecs()
+                                      ? gpu_options.polling_active_delay_usecs()
+                                      : 10),
       accumulated_stream_(nullptr),
       accumulated_tensors_(new TensorReferenceVector),
       accumulated_tensor_bytes_(0),
@@ -57,6 +58,11 @@ EventMgr::~EventMgr() {
       delete ue->mem;
     }
     if (ue->bufrec.buf) {
+      if (LogMemory::IsEnabled()) {
+        LogMemory::RecordRawDeallocation(ue->bufrec.operation,
+                                         ue->bufrec.step_id, ue->bufrec.buf,
+                                         ue->bufrec.alloc, false);
+      }
       ue->bufrec.alloc->DeallocateRaw(ue->bufrec.buf);
     }
     if (ue->func != nullptr) threadpool_.Schedule(ue->func);
@@ -65,22 +71,28 @@ EventMgr::~EventMgr() {
 }
 
 void EventMgr::StartPollingLoop() {
-  CHECK(polling_stopped_.get() == nullptr);
-  stop_polling_.reset(new Notification);
+  CHECK(polling_stopped_ == nullptr);
+  {
+    mutex_lock l(mu_);
+    stop_polling_ = false;
+  }
   polling_stopped_.reset(new Notification);
   threadpool_.Schedule([this]() { PollLoop(); });
 }
 
 void EventMgr::StopPollingLoop() {
-  if (stop_polling_.get()) {
-    stop_polling_->Notify();
+  if (polling_stopped_) {
+    {
+      mutex_lock l(mu_);
+      stop_polling_ = true;
+      events_pending_.notify_all();
+    }
     polling_stopped_->WaitForNotification();
-    stop_polling_.reset(nullptr);
     polling_stopped_.reset(nullptr);
   }
 }
 
-void EventMgr::ThenDeleteTensors(perftools::gputools::Stream* stream,
+void EventMgr::ThenDeleteTensors(se::Stream* stream,
                                  const TensorReferenceVector& tensors) {
   mutex_lock l(mu_);
   // TODO(jeff): We currently keep one accumulated_tensors_ object.
@@ -90,7 +102,7 @@ void EventMgr::ThenDeleteTensors(perftools::gputools::Stream* stream,
     FlushAccumulatedTensors();
   }
   accumulated_stream_ = stream;
-  for (auto t : tensors) {
+  for (const auto& t : tensors) {
     // accumulated_tensors_ takes over ownership of the reference to "t"
     accumulated_tensors_->push_back(t);
     accumulated_tensor_bytes_ += t.TotalBytes();
@@ -109,44 +121,45 @@ void EventMgr::FlushAccumulatedTensors() {
   accumulated_stream_ = nullptr;
 }
 
-// A polling loop to detect completion of GPU events.  There's a
-// tradeoff between achieving low latency detection, which argues for
-// little delay between calls, and minimizing CPU use and lock
-// contention, which argue for longer delay.  The current strategy is
-// to poll frequently when the queue is non-empty, and infrequently
-// otherwise.
+// A polling loop to detect completion of GPU events.
+//
+// While one or more events is outstanding, poll for completed events.  When no
+// events are outstanding, we sleep until one is enqueued.
 void EventMgr::PollLoop() {
-  const int32 kPollingDelayUsecs = 10;
-  const int32 kPollingSuspendMsecs = 1;
-  bool queue_empty = false;
-  while (!stop_polling_->HasBeenNotified()) {
-    if (queue_empty) {
-      mutex_lock l(mu_);
-      WaitForMilliseconds(&l, &events_pending_, kPollingSuspendMsecs);
-    } else {
-      Env::Default()->SleepForMicroseconds(kPollingDelayUsecs);
-    }
-    ToFreeVector to_free;
+  ToFreeVector to_free;
+  while (true) {
+    bool events_still_pending;
     {
       mutex_lock l(mu_);
+      if (stop_polling_) {
+        break;
+      }
+      if (used_events_.empty()) {
+        events_pending_.wait(l);
+      }
       PollEvents(true, &to_free);
-      queue_empty = used_events_.empty();
+      events_still_pending = !used_events_.empty();
     }
     FreeMemory(to_free);
+    to_free.clear();
+
+    if (events_still_pending) {
+      Env::Default()->SleepForMicroseconds(polling_active_delay_usecs_);
+    }
   }
   polling_stopped_->Notify();
 }
 
-void EventMgr::QueueInUse(gpu::Stream* stream, InUse iu) {
+void EventMgr::QueueInUse(se::Stream* stream, InUse iu) {
   VLOG(2) << "QueueInUse  free_events_ " << free_events_.size()
           << " used_events_ " << used_events_.size();
   // Events are created on demand, and repeatedly reused.  There is no
   // limit placed here on the number of allocated Events.
   if (free_events_.empty()) {
-    free_events_.push_back(new gpu::Event(exec_));
+    free_events_.push_back(new se::Event(exec_));
     free_events_.back()->Init();
   }
-  gpu::Event* e = free_events_.back();
+  se::Event* e = free_events_.back();
   free_events_.pop_back();
   stream->ThenRecordEvent(e);
   iu.event = e;
@@ -184,18 +197,18 @@ void EventMgr::PollEvents(bool is_dedicated_poller,
   // the first non-complete record that is still pending.
   for (auto& iu : used_events_) {
     if (iu.event == nullptr) continue;
-    gpu::Event::Status s = iu.event->PollForStatus();
+    se::Event::Status s = iu.event->PollForStatus();
     switch (s) {
-      case gpu::Event::Status::kUnknown:
-      case gpu::Event::Status::kError:
+      case se::Event::Status::kUnknown:
+      case se::Event::Status::kError:
         // We don't expect to see these.  Someday maybe propagate
         // a Status error, but for now fail hard.
         LOG(FATAL) << "Unexpected Event status: " << static_cast<int>(s);
         break;
-      case gpu::Event::Status::kPending:
+      case se::Event::Status::kPending:
         if (!is_dedicated_poller) return;  // quit processing queue
         break;
-      case gpu::Event::Status::kComplete:
+      case se::Event::Status::kComplete:
         // Make a copy of the InUse record so we can free it after releasing
         // the lock
         to_free->push_back(iu);

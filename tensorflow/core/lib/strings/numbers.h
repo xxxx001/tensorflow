@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <string>
 
+#include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
@@ -59,47 +60,118 @@ static const int kFastToBufferSize = 32;
 // the output.  The buffer should typically be at least kFastToBufferSize
 // bytes.
 //
-// Returns a pointer to the end of the string (i.e. the null character
-// terminating the string).
+// Returns the number of characters written.
 // ----------------------------------------------------------------------
 
-char* FastInt32ToBufferLeft(int32 i, char* buffer);    // at least 12 bytes
-char* FastUInt32ToBufferLeft(uint32 i, char* buffer);  // at least 12 bytes
-char* FastInt64ToBufferLeft(int64 i, char* buffer);    // at least 22 bytes
-char* FastUInt64ToBufferLeft(uint64 i, char* buffer);  // at least 22 bytes
+size_t FastInt32ToBufferLeft(int32 i, char* buffer);    // at least 12 bytes
+size_t FastUInt32ToBufferLeft(uint32 i, char* buffer);  // at least 12 bytes
+size_t FastInt64ToBufferLeft(int64 i, char* buffer);    // at least 22 bytes
+size_t FastUInt64ToBufferLeft(uint64 i, char* buffer);  // at least 22 bytes
 
 // Required buffer size for DoubleToBuffer is kFastToBufferSize.
 // Required buffer size for FloatToBuffer is kFastToBufferSize.
-char* DoubleToBuffer(double i, char* buffer);
-char* FloatToBuffer(float i, char* buffer);
+size_t DoubleToBuffer(double value, char* buffer);
+size_t FloatToBuffer(float value, char* buffer);
 
 // Convert a 64-bit fingerprint value to an ASCII representation.
 string FpToString(Fprint fp);
 
 // Attempt to parse a fingerprint in the form encoded by FpToString.  If
-// successsful, stores the fingerprint in *fp and returns true.  Otherwise,
+// successful, stores the fingerprint in *fp and returns true.  Otherwise,
 // returns false.
 bool StringToFp(const string& s, Fprint* fp);
+
+// Convert a 64-bit fingerprint value to an ASCII representation that
+// is terminated by a '\0'.
+// Buf must point to an array of at least kFastToBufferSize characters
+StringPiece Uint64ToHexString(uint64 v, char* buf);
+
+// Attempt to parse a uint64 in the form encoded by FastUint64ToHexString.  If
+// successful, stores the value in *v and returns true.  Otherwise,
+// returns false.
+bool HexStringToUint64(const StringPiece& s, uint64* v);
 
 // Convert strings to 32bit integer values.
 // Leading and trailing spaces are allowed.
 // Return false with overflow or invalid input.
-bool safe_strto32(const char* str, int32* value);
+bool safe_strto32(StringPiece str, int32* value);
+
+// Convert strings to unsigned 32bit integer values.
+// Leading and trailing spaces are allowed.
+// Return false with overflow or invalid input.
+bool safe_strtou32(StringPiece str, uint32* value);
 
 // Convert strings to 64bit integer values.
 // Leading and trailing spaces are allowed.
 // Return false with overflow or invalid input.
-bool safe_strto64(const char* str, int64* value);
+bool safe_strto64(StringPiece str, int64* value);
+
+// Convert strings to unsigned 64bit integer values.
+// Leading and trailing spaces are allowed.
+// Return false with overflow or invalid input.
+bool safe_strtou64(StringPiece str, uint64* value);
 
 // Convert strings to floating point values.
 // Leading and trailing spaces are allowed.
 // Values may be rounded on over- and underflow.
+// Returns false on invalid input or if `strlen(value) >= kFastToBufferSize`.
 bool safe_strtof(const char* str, float* value);
+
+// Convert strings to double precision floating point values.
+// Leading and trailing spaces are allowed.
+// Values may be rounded on over- and underflow.
+// Returns false on invalid input or if `strlen(value) >= kFastToBufferSize`.
+bool safe_strtod(const char* str, double* value);
+
+inline bool ProtoParseNumeric(StringPiece s, int32* value) {
+  return safe_strto32(s, value);
+}
+
+inline bool ProtoParseNumeric(StringPiece s, uint32* value) {
+  return safe_strtou32(s, value);
+}
+
+inline bool ProtoParseNumeric(StringPiece s, int64* value) {
+  return safe_strto64(s, value);
+}
+
+inline bool ProtoParseNumeric(StringPiece s, uint64* value) {
+  return safe_strtou64(s, value);
+}
+
+inline bool ProtoParseNumeric(StringPiece s, float* value) {
+  return safe_strtof(std::string(s).c_str(), value);
+}
+
+inline bool ProtoParseNumeric(StringPiece s, double* value) {
+  return safe_strtod(std::string(s).c_str(), value);
+}
+
+// Convert strings to number of type T.
+// Leading and trailing spaces are allowed.
+// Values may be rounded on over- and underflow.
+template <typename T>
+bool SafeStringToNumeric(StringPiece s, T* value) {
+  return ProtoParseNumeric(s, value);
+}
+
+// Converts from an int64 to a human readable string representing the
+// same number, using decimal powers.  e.g. 1200000 -> "1.20M".
+string HumanReadableNum(int64 value);
 
 // Converts from an int64 representing a number of bytes to a
 // human readable string representing the same number.
 // e.g. 12345678 -> "11.77MiB".
 string HumanReadableNumBytes(int64 num_bytes);
+
+// Converts a time interval as double to a human readable
+// string. For example:
+//   0.001       -> "1 ms"
+//   10.0        -> "10 s"
+//   933120.0    -> "10.8 days"
+//   39420000.0  -> "1.25 years"
+//   -10         -> "-10 s"
+string HumanReadableElapsedTime(double seconds);
 
 }  // namespace strings
 }  // namespace tensorflow

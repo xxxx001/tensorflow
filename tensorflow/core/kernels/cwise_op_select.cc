@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,17 @@ limitations under the License.
 #endif  // GOOGLE_CUDA
 
 #include "tensorflow/core/framework/register_types.h"
+#include "tensorflow/core/kernels/bounds_check.h"
 #include "tensorflow/core/kernels/cwise_ops_common.h"
 
 namespace tensorflow {
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
 typedef Eigen::GpuDevice GPUDevice;
+
+#ifdef TENSORFLOW_USE_SYCL
+typedef Eigen::SyclDevice SYCLDevice;
+#endif  // TENSORFLOW_USE_SYCL
 
 template <typename Device, typename T>
 class SelectOp : public OpKernel {
@@ -39,6 +44,11 @@ class SelectOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->input("condition", &cond));
     OP_REQUIRES_OK(ctx, ctx->input("t", &then));
     OP_REQUIRES_OK(ctx, ctx->input("e", &else_));
+
+    if (TensorShapeUtils::IsScalar(cond->shape())) {
+      ComputeScalar(ctx, cond, then, else_);
+      return;
+    }
 
     bool broadcasting = (TensorShapeUtils::IsVector(cond->shape()) &&
                          !TensorShapeUtils::IsVector(then->shape()));
@@ -58,6 +68,18 @@ class SelectOp : public OpKernel {
         ctx, TensorShapeUtils::IsVector(cond->shape()),
         errors::InvalidArgument("'cond' must be a vector, but saw shape: ",
                                 cond->shape().DebugString()));
+    OP_REQUIRES(
+        ctx,
+        FastBoundsCheck(cond->NumElements(),
+                        std::numeric_limits<Eigen::DenseIndex>::max()),
+        errors::InvalidArgument("cond vector larger than ",
+                                std::numeric_limits<Eigen::DenseIndex>::max()));
+    OP_REQUIRES(
+        ctx,
+        FastBoundsCheck(then->flat_outer_dims<T>().dimension(1),
+                        std::numeric_limits<Eigen::DenseIndex>::max()),
+        errors::InvalidArgument("flat outer dims dim 1 size >= ",
+                                std::numeric_limits<Eigen::DenseIndex>::max()));
 
     OP_REQUIRES(ctx, TensorShapeUtils::IsVectorOrHigher(then->shape()),
                 errors::InvalidArgument(
@@ -66,7 +88,7 @@ class SelectOp : public OpKernel {
     OP_REQUIRES(
         ctx, then->shape().dim_size(0) == cond->NumElements(),
         errors::InvalidArgument(
-            "Number of batchs of 'then' must match size of 'cond', but saw: ",
+            "Number of batches of 'then' must match size of 'cond', but saw: ",
             then->shape().dim_size(0), " vs. ", cond->NumElements()));
     OP_REQUIRES(
         ctx, then->shape().IsSameSize(else_->shape()),
@@ -76,22 +98,48 @@ class SelectOp : public OpKernel {
             else_->shape().DebugString()));
 
     Tensor* output = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, then->shape(), &output));
-
-    functor::BatchSelectFunctor<Device, T> func;
-    func(ctx->eigen_device<Device>(), output->flat_outer_dims<T>(),
-         cond->vec<bool>(), then->flat_outer_dims<T>(),
-         else_->flat_outer_dims<T>());
+    OP_REQUIRES_OK(ctx, ctx->forward_input_or_allocate_output(
+                            {"t", "e"}, "output", then->shape(), &output));
+    if (output->NumElements() > 0) {
+      functor::BatchSelectFunctor<Device, T> func;
+      func(ctx->eigen_device<Device>(), output->flat_outer_dims<T>(),
+           cond->vec<bool>(), then->flat_outer_dims<T>(),
+           else_->flat_outer_dims<T>());
+    }
   }
 
   void ComputeElementwise(OpKernelContext* ctx, const Tensor* cond,
                           const Tensor* then, const Tensor* else_) {
     if (!ctx->ValidateInputsAreSameShape(this)) return;
     Tensor* output = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, then->shape(), &output));
-    functor::SelectFunctor<Device, T> func;
-    func(ctx->eigen_device<Device>(), output->flat<T>(), cond->flat<bool>(),
-         then->flat<T>(), else_->flat<T>());
+    OP_REQUIRES_OK(ctx, ctx->forward_input_or_allocate_output(
+                            {"t", "e"}, "output", then->shape(), &output));
+    if (output->NumElements() > 0) {
+      functor::SelectFunctor<Device, T> func;
+      func(ctx->eigen_device<Device>(), output->flat<T>(), cond->flat<bool>(),
+           then->flat<T>(), else_->flat<T>());
+    }
+  }
+
+  void ComputeScalar(OpKernelContext* ctx, const Tensor* cond,
+                     const Tensor* then, const Tensor* else_) {
+    OP_REQUIRES(
+        ctx, then->shape().IsSameSize(else_->shape()),
+        errors::InvalidArgument(
+            "'then' and 'else' must have the same size.  but received: ",
+            then->shape().DebugString(), " vs. ",
+            else_->shape().DebugString()));
+
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->forward_input_or_allocate_output(
+                            {"t", "e"}, "output", then->shape(), &output));
+
+    if (output->NumElements() > 0) {
+      functor::SelectScalarFunctor<Device, T> func;
+      TTypes<bool>::ConstScalar cond_scalar = cond->scalar<bool>();
+      func(ctx->eigen_device<Device>(), output->flat<T>(), cond_scalar,
+           then->flat<T>(), else_->flat<T>());
+    }
   }
 
  private:
@@ -113,22 +161,38 @@ TF_CALL_ALL_TYPES(REGISTER_SELECT);
       Name("Select").Device(DEVICE_GPU).TypeConstraint<type>("T"), \
       SelectOp<GPUDevice, type>);
 
+REGISTER_SELECT_GPU(Eigen::half);
 REGISTER_SELECT_GPU(float);
 REGISTER_SELECT_GPU(double);
 REGISTER_SELECT_GPU(int32);
 REGISTER_SELECT_GPU(int64);
 REGISTER_SELECT_GPU(complex64);
+REGISTER_SELECT_GPU(complex128);
 
 #undef REGISTER_SELECT_GPU
 
 #endif  // GOOGLE_CUDA
 
+#ifdef TENSORFLOW_USE_SYCL
+// Registration of the SYCL implementations.
+#define REGISTER_SELECT_SYCL(type)                                  \
+  REGISTER_KERNEL_BUILDER(                                          \
+      Name("Select").Device(DEVICE_SYCL).TypeConstraint<type>("T"), \
+      SelectOp<SYCLDevice, type>);
+
+REGISTER_SELECT_SYCL(float);
+REGISTER_SELECT_SYCL(double);
+REGISTER_SELECT_SYCL(int32);
+REGISTER_SELECT_SYCL(int64);
+#undef REGISTER_SELECT_SYCL
+#endif  // TENSORFLOW_USE_SYCL
+
 namespace functor {
 
 // CPU Specializations of Select functors.
-template <typename T>
-struct SelectFunctor<CPUDevice, T> {
-  void operator()(const CPUDevice& d, typename TTypes<T>::Flat out,
+template <typename Device, typename T>
+struct SelectFunctorBase {
+  void operator()(const Device& d, typename TTypes<T>::Flat out,
                   typename TTypes<bool>::ConstFlat cond_flat,
                   typename TTypes<T>::ConstFlat then_flat,
                   typename TTypes<T>::ConstFlat else_flat) {
@@ -137,18 +201,45 @@ struct SelectFunctor<CPUDevice, T> {
 };
 
 template <typename T>
-struct BatchSelectFunctor<CPUDevice, T> {
-  void operator()(const CPUDevice& d,
+struct SelectFunctor<CPUDevice, T> : SelectFunctorBase<CPUDevice, T> {};
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+struct SelectFunctor<SYCLDevice, T> : SelectFunctorBase<SYCLDevice, T> {};
+#endif  // TENSORFLOW_USE_SYCL
+
+template <typename Device, typename T>
+struct SelectScalarFunctorBase {
+  void operator()(const Device& d, typename TTypes<T>::Flat out,
+                  TTypes<bool>::ConstScalar cond,
+                  typename TTypes<T>::ConstFlat then_flat,
+                  typename TTypes<T>::ConstFlat else_flat) {
+    out.device(d) = cond() ? then_flat : else_flat;
+  }
+};
+
+// CPU Specializations of Select functors with scalar
+template <typename T>
+struct SelectScalarFunctor<CPUDevice, T>
+    : SelectScalarFunctorBase<CPUDevice, T> {};
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+struct SelectScalarFunctor<SYCLDevice, T>
+    : SelectScalarFunctorBase<SYCLDevice, T> {};
+#endif  // TENSORFLOW_USE_SYCL
+
+template <typename Device, typename T>
+struct BatchSelectFunctorBase {
+  void operator()(const Device& d,
                   typename TTypes<T>::Matrix output_flat_outer_dims,
                   TTypes<bool>::ConstVec cond_vec,
                   typename TTypes<T>::ConstMatrix then_flat_outer_dims,
                   typename TTypes<T>::ConstMatrix else_flat_outer_dims) {
-    const int batch = cond_vec.size();
-    const int all_but_batch = then_flat_outer_dims.dimension(1);
+    const Eigen::DenseIndex batch = cond_vec.size();
+    const Eigen::DenseIndex all_but_batch = then_flat_outer_dims.dimension(1);
 
 #if !defined(EIGEN_HAS_INDEX_LIST)
-    Eigen::array<Eigen::DenseIndex, 2> broadcast_dims{{ 1, all_but_batch }};
-    Eigen::Tensor<Eigen::DenseIndex, 2>::Dimensions reshape_dims{{ batch, 1 }};
+    Eigen::array<Eigen::DenseIndex, 2> broadcast_dims{{1, all_but_batch}};
+    Eigen::Tensor<Eigen::DenseIndex, 2>::Dimensions reshape_dims{{batch, 1}};
 #else
     Eigen::IndexList<Eigen::type2index<1>, Eigen::DenseIndex> broadcast_dims;
     broadcast_dims.set(1, all_but_batch);
@@ -162,6 +253,15 @@ struct BatchSelectFunctor<CPUDevice, T> {
                .select(then_flat_outer_dims, else_flat_outer_dims));
   }
 };
+
+template <typename T>
+struct BatchSelectFunctor<CPUDevice, T> : BatchSelectFunctorBase<CPUDevice, T> {
+};
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+struct BatchSelectFunctor<SYCLDevice, T>
+    : BatchSelectFunctorBase<SYCLDevice, T> {};
+#endif  // TENSORFLOW_USE_SYCL
 
 }  // namespace functor
 

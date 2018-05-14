@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 Implements the inference/loss/training pattern for model building.
 
-1. inference() - Builds the model as far as is required for running the network
+1. inference() - Builds the model as far as required for running the network
 forward to make predictions.
 2. loss() - Adds to the inference model the layers required to generate loss.
 3. training() - Adds to the loss model the Ops required to generate and
@@ -32,7 +32,6 @@ from __future__ import print_function
 
 import math
 
-import tensorflow.python.platform
 import tensorflow as tf
 
 # The MNIST dataset has 10 classes, representing the digits 0 through 9.
@@ -94,21 +93,8 @@ def loss(logits, labels):
   Returns:
     loss: Loss tensor of type float.
   """
-  # Convert from sparse integer labels in the range [0, NUM_CLASSES)
-  # to 1-hot dense float vectors (that is we will have batch_size vectors,
-  # each with NUM_CLASSES values, all of which are 0.0 except there will
-  # be a 1.0 in the entry corresponding to the label).
-  batch_size = tf.size(labels)
-  labels = tf.expand_dims(labels, 1)
-  indices = tf.expand_dims(tf.range(0, batch_size), 1)
-  concated = tf.concat(1, [indices, labels])
-  onehot_labels = tf.sparse_to_dense(
-      concated, tf.pack([batch_size, NUM_CLASSES]), 1.0, 0.0)
-  cross_entropy = tf.nn.softmax_cross_entropy_with_logits(logits,
-                                                          onehot_labels,
-                                                          name='xentropy')
-  loss = tf.reduce_mean(cross_entropy, name='xentropy_mean')
-  return loss
+  labels = tf.to_int64(labels)
+  return tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
 
 
 def training(loss, learning_rate):
@@ -129,7 +115,7 @@ def training(loss, learning_rate):
     train_op: The Op for training.
   """
   # Add a scalar summary for the snapshot loss.
-  tf.scalar_summary(loss.op.name, loss)
+  tf.summary.scalar('loss', loss)
   # Create the gradient descent optimizer with the given learning rate.
   optimizer = tf.train.GradientDescentOptimizer(learning_rate)
   # Create a variable to track the global step.
@@ -154,7 +140,7 @@ def evaluation(logits, labels):
   """
   # For a classifier model, we can use the in_top_k Op.
   # It returns a bool tensor with shape [batch_size] that is true for
-  # the examples where the label's is was in the top k (here k=1)
+  # the examples where the label is in the top k (here k=1)
   # of all logits for that example.
   correct = tf.nn.in_top_k(logits, labels, 1)
   # Return the number of true entries.

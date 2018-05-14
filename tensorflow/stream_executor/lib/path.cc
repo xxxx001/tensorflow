@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,11 +16,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/lib/path.h"
 #include "tensorflow/stream_executor/lib/strcat.h"
 
-using ::perftools::gputools::port::StringPiece;
-using ::perftools::gputools::port::StrAppend;
-
-namespace perftools {
-namespace gputools {
+namespace stream_executor {
 namespace port {
 namespace internal {
 
@@ -37,7 +33,7 @@ string JoinPathImpl(std::initializer_list<port::StringPiece> paths) {
     if (path.empty()) continue;
 
     if (result.empty()) {
-      result = path.ToString();
+      result = std::string(path);
       continue;
     }
 
@@ -61,5 +57,4 @@ string JoinPathImpl(std::initializer_list<port::StringPiece> paths) {
 
 }  // namespace internal
 }  // namespace port
-}  // namespace gputools
-}  // namespace perftools
+}  // namespace stream_executor

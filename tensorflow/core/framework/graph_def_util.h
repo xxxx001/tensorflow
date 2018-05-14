@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,13 @@ limitations under the License.
 #define TENSORFLOW_FRAMEWORK_GRAPH_DEF_UTIL_H_
 
 #include <set>
-
-#include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/lib/core/status.h"
 
 namespace tensorflow {
+
+// Forward declare proto so that it's symbols can be removed from .so exports
+class GraphDef;
 
 // Produce a human-readable version of a GraphDef that is more concise
 // than a text-format proto.
@@ -55,6 +56,12 @@ Status AddDefaultAttrsToGraphDef(GraphDef* graph_def,
                                  const OpRegistryInterface& op_registry,
                                  int node_offset);
 
+// Same as above, except for the fact that it skips nodes that aren't found in
+// op_registry if skip_unknown_ops is true.
+Status AddDefaultAttrsToGraphDef(GraphDef* graph_def,
+                                 const OpRegistryInterface& op_registry,
+                                 int node_offset, bool skip_unknown_ops);
+
 // Remove attrs from 'graph_def' that have the default value according
 // to 'producer_op_registry', but don't exist according to
 // 'consumer_op_registry'. This can allow 'graph_def' to run on the
@@ -62,10 +69,11 @@ Status AddDefaultAttrsToGraphDef(GraphDef* graph_def,
 // attr with a default was added). Note that this will not affect
 // attrs with non-default values, so you must run a
 // ValidateGraphDef...() function to see if the result is in fact
-// compatible. If not nulllptr, the op/attr pairs that were removed
+// compatible. If not nullptr, the op/attr pairs that were removed
 // are added to '*op_attr_removed'.
 //
-// Expected usage:
+// Expected usage, for a producer that wants to prepare a graph for
+// a consumer:
 // // For each consumer, update 'graph_def':
 //   OpListOpRegistry consumer_op_registry(consumer_server_op_list);
 //   std::unordered_set<std::pair<string, string>> op_attr_removed;
@@ -77,10 +85,36 @@ Status AddDefaultAttrsToGraphDef(GraphDef* graph_def,
 //       graph_def, consumer_op_registry));
 // // Consumer can use 'graph_def', and 'op_attr_removed' summarizes
 // // what changes had to be made to 'graph_def' for it to work.
+//
+// Expected usage, for a consumer that has a graph and a
+// (optionally-stripped) op_list from a producer (say from a call to
+// StrippedOpListForGraph(), or in the MetaGraphDef):
+//   OpListOpRegistry producer_op_registry(producer_stripped_op_list);
+//   TF_RETURN_IF_ERROR(RemoveNewDefaultAttrsFromGraphDef(
+//       &graph_def, *OpRegistry::Global(), producer_op_registry, nullptr));
 Status RemoveNewDefaultAttrsFromGraphDef(
     GraphDef* graph_def, const OpRegistryInterface& consumer_op_registry,
     const OpRegistryInterface& producer_op_registry,
     std::set<std::pair<string, string>>* op_attr_removed);
+
+// Two functions that collect the ops used by a graph.
+//
+// This returns the ops used as a set of strings.
+void OpsUsedByGraph(const GraphDef& graph_def,
+                    std::set<string>* ops_used_in_graph);
+
+// This function computes the stripped_op_list field of MetaGraphDef
+// and similar protos.  The op_registry should contain the ops used to
+// produce graph_def.  The resulting stripped_op_list can be
+// communicated from the producer to the consumer, which can use
+// RemoveNewDefaultAttrsFromGraphDef() to improve forwards compatibility
+// (using an OpListOpRegistry as indicated in the example above).
+//
+// Most users will pass *OpRegistry::Global() for op_registry to strip against
+// the list of ops registered in this process.
+Status StrippedOpListForGraph(const GraphDef& graph_def,
+                              const OpRegistryInterface& op_registry,
+                              OpList* stripped_op_list);
 
 }  // namespace tensorflow
 

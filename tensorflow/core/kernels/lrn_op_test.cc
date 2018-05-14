@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ limitations under the License.
 
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/framework/fake_input.h"
-#include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -36,7 +35,7 @@ static const float tol_ = 1e-4;
 
 class LRNFloatTest : public OpsTestBase {
  protected:
-  LRNFloatTest() : philox_(123, 17), rand_(&philox_) { RequireDefaultOps(); }
+  LRNFloatTest() : philox_(123, 17), rand_(&philox_) {}
 
   int GetIntAttr(const string& name) {
     int value;

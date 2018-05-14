@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,8 +20,10 @@ limitations under the License.
 #include "tensorflow/core/platform/platform.h"
 
 // Include appropriate platform-dependent implementations
-#if defined(PLATFORM_GOOGLE)
+#if defined(PLATFORM_GOOGLE) || defined(GOOGLE_INTEGRAL_TYPES)
 #include "tensorflow/core/platform/google/integral_types.h"
+#elif defined(PLATFORM_WINDOWS)
+#include "tensorflow/core/platform/windows/integral_types.h"
 #elif defined(PLATFORM_POSIX) || defined(PLATFORM_POSIX_ANDROID) || \
     defined(PLATFORM_GOOGLE_ANDROID)
 #include "tensorflow/core/platform/default/integral_types.h"
@@ -56,6 +58,12 @@ static const int64 kint64max = ((int64)0x7FFFFFFFFFFFFFFFll);
 // A typedef for a uint64 used as a short fingerprint.
 typedef uint64 Fprint;
 
+}  // namespace tensorflow
+
+// Alias namespace ::stream_executor as ::tensorflow::se.
+namespace stream_executor {}
+namespace tensorflow {
+namespace se = ::stream_executor;
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_PLATFORM_TYPES_H_

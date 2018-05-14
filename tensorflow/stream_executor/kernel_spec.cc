@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,16 +15,14 @@ limitations under the License.
 
 #include "tensorflow/stream_executor/kernel_spec.h"
 
-
-namespace perftools {
-namespace gputools {
+namespace stream_executor {
 
 KernelLoaderSpec::KernelLoaderSpec(port::StringPiece kernelname)
-    : kernelname_(kernelname.ToString()) {}
+    : kernelname_(std::string(kernelname)) {}
 
 OnDiskKernelLoaderSpec::OnDiskKernelLoaderSpec(port::StringPiece filename,
                                                port::StringPiece kernelname)
-    : KernelLoaderSpec(kernelname), filename_(filename.ToString()) {}
+    : KernelLoaderSpec(kernelname), filename_(std::string(filename)) {}
 
 CudaPtxOnDisk::CudaPtxOnDisk(port::StringPiece filename,
                              port::StringPiece kernelname)
@@ -103,7 +101,7 @@ const char *CudaPtxInMemory::default_text() const {
   if (decompressed_ptx_iter != decompressed_ptx_.end()) {
     // If the decompressed string is empty, which means the ptx hasn't been
     // decompressed, decompress it here.
-    if (decompressed_ptx_iter->second.size() == 0) {
+    if (decompressed_ptx_iter->second.empty()) {
       decompressed_ptx_iter->second = DecompressPtx(ptx);
     }
     return decompressed_ptx_iter->second.c_str();
@@ -136,7 +134,7 @@ const char *CudaPtxInMemory::text(int compute_capability_major,
   if (decompressed_ptx_iter != decompressed_ptx_.end()) {
     // If the decompressed string is empty, which means the ptx hasn't been
     // decompressed, decompress it here.
-    if (decompressed_ptx_iter->second.size() == 0) {
+    if (decompressed_ptx_iter->second.empty()) {
       decompressed_ptx_iter->second = DecompressPtx(ptx_iter->second);
     }
     return decompressed_ptx_iter->second.c_str();
@@ -163,7 +161,7 @@ OpenCLTextOnDisk::OpenCLTextOnDisk(port::StringPiece filename,
 
 OpenCLTextInMemory::OpenCLTextInMemory(port::StringPiece text,
                                        port::StringPiece kernelname)
-    : KernelLoaderSpec(kernelname), text_(text.ToString()) {}
+    : KernelLoaderSpec(kernelname), text_(std::string(text)) {}
 
 OpenCLBinaryOnDisk::OpenCLBinaryOnDisk(port::StringPiece filename,
                                        port::StringPiece kernelname)
@@ -247,5 +245,4 @@ MultiKernelLoaderSpec *MultiKernelLoaderSpec::AddCudaCompressedPtxInMemory(
 
 MultiKernelLoaderSpec::MultiKernelLoaderSpec(size_t arity) : arity_(arity) {}
 
-}  // namespace gputools
-}  // namespace perftools
+}  // namespace stream_executor
