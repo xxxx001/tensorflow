@@ -431,6 +431,13 @@ void BaseGPUDevice::Compute(OpKernel* op_kernel, OpKernelContext* context) {
   }
 }
 
+string BaseGPUDevice::ComputeOpKernelDebugString(const OpKernel& op_kernel,
+                                                 const int& stream_id) {
+  return strings::StrCat(op_kernel.name(), " op ", op_kernel.type_string(),
+                         " on GPU ", tf_gpu_id_.value(), " stream[", stream_id,
+                         "]");
+}
+
 void BaseGPUDevice::ComputeHelper(OpKernel* op_kernel,
                                   OpKernelContext* context) {
   GPUDeviceContext* gpu_device_context = device_contexts_[0];
@@ -445,9 +452,8 @@ void BaseGPUDevice::ComputeHelper(OpKernel* op_kernel,
   const bool vlog_2 = vlog_1 && VLOG_IS_ON(2);
 
   if (vlog_1) {
-    VLOG(1) << "GpuDevice::Compute " << op_kernel->name() << " op "
-            << op_kernel->type_string() << " on GPU" << tf_gpu_id_ << " stream["
-            << stream_id << "]";
+    VLOG(1) << "GpuDevice::ComputeHelper "
+            << ComputeOpKernelDebugString(*op_kernel, stream_id);
   }
 
   const auto num_streams = streams_.size();
@@ -491,6 +497,18 @@ void BaseGPUDevice::ComputeHelper(OpKernel* op_kernel,
       // all streams.  Given that this flag is typically used for
       // debugging it makes more sense to sync all GPU activity.
       context->SetStatus(GPUUtil::SyncAll(this));
+      if (vlog_1) {
+        VLOG(1) << "GpuDevice::ComputeHelper finished "
+                << ComputeOpKernelDebugString(*op_kernel, stream_id);
+      }
+    } else if (vlog_1) {
+      VLOG(1) << "GpuDevice::ComputeHelper scheduled "
+              << ComputeOpKernelDebugString(*op_kernel, stream_id);
+    }
+  } else {
+    if (vlog_1) {
+      VLOG(1) << "GpuDevice::ComputeHelper failed to schedule "
+              << ComputeOpKernelDebugString(*op_kernel, stream_id);
     }
   }
 }
@@ -791,6 +809,20 @@ Status SingleVirtualDeviceMemoryLimit(const GPUOptions& gpu_options,
   int64 allocated_memory = 0;
   const double per_process_gpu_memory_fraction =
       gpu_options.per_process_gpu_memory_fraction();
+  if (per_process_gpu_memory_fraction > 1.0 ||
+      gpu_options.experimental().use_unified_memory()) {
+    int cc_major = 0, cc_minor = 0;
+    if (!se->GetDeviceDescription().cuda_compute_capability(&cc_major,
+                                                            &cc_minor)) {
+      return errors::Internal("Failed to get compute capability for device.");
+    }
+    if (cc_major < 6) {
+      return errors::Internal(
+          "Unified memory on GPUs with compute capability lower than 6.0 "
+          "(pre-Pascal class GPUs) does not support oversubscription.");
+    }
+  }
+
   if (per_process_gpu_memory_fraction == 0) {
     allocated_memory = available_memory;
     const int64 min_system_memory = MinSystemMemory(available_memory);
@@ -879,7 +911,8 @@ Status BaseGPUDeviceFactory::CreateDevices(const SessionOptions& options,
   if (num_gpus_to_use > valid_cuda_gpu_ids.size()) {
     num_gpus_to_use = valid_cuda_gpu_ids.size();
   }
-  if (!valid_cuda_gpu_ids.empty()) {
+  // If we aren't going to use any GPUs, don't initialize them.
+  if (num_gpus_to_use > 0 && !valid_cuda_gpu_ids.empty()) {
     // Save the original device.
     int original_device = 0;
     cudaError_t err = cudaGetDevice(&original_device);

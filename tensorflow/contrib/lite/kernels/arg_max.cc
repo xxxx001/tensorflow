@@ -52,7 +52,8 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
       output->type = kTfLiteInt64;
       break;
     default:
-      context->ReportError(context, "Unknown index output data type");
+      context->ReportError(context, "Unknown index output data type: %d",
+                           params->output_type);
       return kTfLiteError;
   }
 
@@ -64,7 +65,10 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
       break;
 
     default:
-      context->ReportError(context, "Only float32 and int types are supported");
+      context->ReportError(
+          context,
+          "Unkonwn input type: %d, only float32 and int types are supported",
+          input->type);
       return kTfLiteError;
   }
 
@@ -84,7 +88,6 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
   TfLiteTensor* output = GetOutput(context, node, kOutputTensor);
 
 #define TF_LITE_ARG_MAX(data_type, axis_type, output_type)                     \
-  TF_LITE_ENSURE_EQ(context, GetTensorData<axis_type>(axis)[0], 3);            \
   optimized_ops::ArgMax(GetTensorData<axis_type>(axis),                        \
                         GetTensorData<data_type>(input), GetTensorDims(input), \
                         GetTensorData<output_type>(output),                    \

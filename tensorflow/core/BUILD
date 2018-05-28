@@ -94,6 +94,7 @@ load(
 load("//tensorflow:tensorflow.bzl", "tf_cc_test_mkl")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test_gpu")
 load("//tensorflow:tensorflow.bzl", "tf_cc_tests_gpu")
+load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_test")
 load("//tensorflow:tensorflow.bzl", "tf_version_info_genrule")
 load("//tensorflow:tensorflow.bzl", "tf_cuda_only_cc_test")
 
@@ -268,6 +269,12 @@ proto_library(
     visibility = ["//visibility:public"],
 )
 
+closure_proto_library(
+    name = "example_protos_closure",
+    visibility = ["//visibility:public"],
+    deps = [":example_protos"],
+)
+
 exports_files([
     "framework/types.proto",
 ])
@@ -338,6 +345,8 @@ cc_library(
     ],
     hdrs = PLATFORM_BASE_HDRS,
     copts = tf_copts(),
+    # TODO(ahentz): remove use of this library so we can move it into 'platform'
+    tags = ["avoid_dep"],
     deps = [
         ":lib_platform",
         "//tensorflow/core/platform/default/build_config:base",
@@ -580,6 +589,7 @@ tf_cuda_library(
         "framework/types.h",
         "public/version.h",
         "util/activation_mode.h",
+        "util/batch_util.h",
         "util/bcast.h",
         "util/cuda_kernel_helper.h",
         "util/device_name_utils.h",
@@ -803,8 +813,6 @@ cc_library(
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:stream_executor",
         "//tensorflow/core/kernels:bounds_check_lib",
-        "//third_party/eigen3",
-        "@farmhash_archive//:farmhash",
     ],
     alwayslink = 1,
 )
@@ -1664,13 +1672,6 @@ LIB_INTERNAL_PRIVATE_HEADERS = ["framework/resource_handle.h"] + glob(
         "platform/**/cuda.h",
         "platform/**/stream_executor.h",
     ],
-) + tf_additional_lib_srcs(
-    exclude = [
-        "**/*.cc",
-        "**/*test*",
-        "platform/**/cuda.h",
-        "platform/**/stream_executor.h",
-    ],
 )
 
 LIB_INTERNAL_PUBLIC_HEADERS = tf_additional_lib_hdrs() + [
@@ -1970,6 +1971,7 @@ tf_proto_library(
     j2objc_api_version = 1,
     java_api_version = 2,
     js_api_version = 2,
+    provide_cc_alias = True,
 )
 
 tf_generate_proto_text_sources(
@@ -3289,7 +3291,10 @@ tf_cc_tests_gpu(
 tf_cc_test_mkl(
     name = "mkl_runtime_tests",
     size = "small",
-    srcs = ["common_runtime/mkl_cpu_allocator_test.cc"],
+    srcs = [
+        "common_runtime/mkl_cpu_allocator_test.cc",
+        "common_runtime/mkl_threadpool_device_test.cc",
+    ],
     linkstatic = 1,
     deps = [
         ":core",
@@ -3380,6 +3385,37 @@ tf_cc_tests_gpu(
         ":framework_internal",
         ":gpu_id",
         ":gpu_runtime",
+        ":lib",
+        ":lib_internal",
+        ":protos_all_cc",
+        ":test",
+        ":test_main",
+        ":testlib",
+        "//tensorflow/cc:cc_ops",
+        "//tensorflow/core/kernels:ops_util",
+    ],
+)
+
+tf_cuda_cc_test(
+    name = "gpu_device_unified_memory_test",
+    size = "small",
+    srcs = [
+        "common_runtime/gpu/gpu_device_test.cc",
+    ],
+    linkstatic = tf_kernel_tests_linkstatic(),
+    # Runs test on a Guitar cluster that uses P100s to test unified memory
+    # allocations.
+    tags = tf_cuda_tests_tags() + [
+        "guitar",
+        "multi_gpu",
+    ],
+    deps = [
+        ":core_cpu",
+        ":core_cpu_internal",
+        ":direct_session",
+        ":framework",
+        ":framework_internal",
+        ":gpu_id",
         ":lib",
         ":lib_internal",
         ":protos_all_cc",
@@ -4199,10 +4235,4 @@ alias(
     name = "android_srcs",
     actual = ":mobile_srcs",
     visibility = ["//visibility:public"],
-)
-
-closure_proto_library(
-    name = "example_protos_closure",
-    visibility = ["//visibility:public"],
-    deps = [":example_protos"],
 )

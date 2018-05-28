@@ -33,18 +33,18 @@ from tensorflow.python.eager import test
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
-from tensorflow.python.keras._impl.keras.engine import training
-from tensorflow.python.keras._impl.keras.layers import core
+from tensorflow.python.keras.engine import training
+from tensorflow.python.keras.layers import core
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import state_ops
 from tensorflow.python.ops import template
 from tensorflow.python.ops import variable_scope
-from tensorflow.python.training import checkpointable
-from tensorflow.python.training import checkpointable_utils
 from tensorflow.python.training import saver as core_saver
 from tensorflow.python.training import training_util
+from tensorflow.python.training.checkpointable import base as checkpointable
+from tensorflow.python.training.checkpointable import util as checkpointable_utils
 
 
 class NonLayerCheckpointable(checkpointable.Checkpointable):
@@ -722,12 +722,22 @@ class CheckpointCompatibilityTests(test.TestCase):
       with self.assertRaises(AssertionError):
         self._check_sentinels(root)
       object_saver = checkpointable_utils.CheckpointableSaver(root)
+      self._set_sentinels(root)
       status = object_saver.restore(save_path)
-      with self.assertRaises(AssertionError):
-        status.assert_consumed()
+      if context.executing_eagerly():
+        self._check_sentinels(root)
+      if context.executing_eagerly():
+        with self.assertRaisesRegexp(AssertionError, "OBJECT_CONFIG_JSON"):
+          status.assert_consumed()
+      else:
+        # When graph building, we haven't read any keys, so we don't know
+        # whether the restore will be complete.
+        with self.assertRaisesRegexp(AssertionError, "not restored"):
+          status.assert_consumed()
       status.run_restore_ops()
       self._check_sentinels(root)
       self._set_sentinels(root)
+      status = object_saver.restore(save_path)
       status.initialize_or_restore()
       self._check_sentinels(root)
 

@@ -53,10 +53,10 @@ from tensorflow.python.ops import string_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import gfile
 from tensorflow.python.platform import tf_logging as logging
-from tensorflow.python.training import checkpointable
 from tensorflow.python.training import saveable_object
 from tensorflow.python.training import training_util
 from tensorflow.python.training.checkpoint_state_pb2 import CheckpointState
+from tensorflow.python.training.checkpointable import base as checkpointable
 from tensorflow.python.util import compat
 from tensorflow.python.util.tf_export import tf_export
 
@@ -1754,13 +1754,17 @@ class Saver(object):
       exception_type, exception_value, exception_traceback = sys.exc_info()
       # The checkpoint would not be loaded successfully as is. Try to parse it
       # as an object-based checkpoint.
+      should_reraise = False
       try:
         reader = pywrap_tensorflow.NewCheckpointReader(save_path)
         object_graph_string = reader.get_tensor(
             checkpointable.OBJECT_GRAPH_PROTO_KEY)
       except errors.NotFoundError:
         # This is not an object-based checkpoint, or the checkpoint doesn't
-        # exist. Re-raise the original exception.
+        # exist. Re-raise the original exception, but do it outside the except
+        # block so the object graph lookup isn't included in the stack trace.
+        should_reraise = True
+      if should_reraise:
         six.reraise(exception_type, exception_value, exception_traceback)
       del exception_traceback  # avoid reference cycles
 
