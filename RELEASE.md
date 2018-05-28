@@ -1,4 +1,4 @@
-# Release 1.8.0
+# Release 1.8.0 **** changle log ******
 
 ## Major Features And Improvements
 * Can now pass `tf.contrib.distribute.MirroredStrategy()` to `tf.estimator.RunConfig()` to run an Estimator model on multiple GPUs on one machine.
