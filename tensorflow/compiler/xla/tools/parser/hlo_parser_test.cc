@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/tools/parser/hlo_parser.h"
 
 #include <string>
+#include "tensorflow/compiler/xla/window_util.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/strings/str_util.h"
@@ -1024,7 +1025,7 @@ ENTRY %configuration_test() -> s32[] {
   EXPECT_EQ("foo bar", result.ValueOrDie()
                            ->entry_computation()
                            ->root_instruction()
-                           ->backend_config());
+                           ->raw_backend_config_string());
 }
 
 TEST_F(HloParserTest, LiteralDimensionsMismatch_1) {
@@ -1314,21 +1315,6 @@ ENTRY consts {
                   "one computation should have only one ROOT");
 }
 
-TEST_F(HloParserTest, InstructionExists) {
-  const string original = R"(HloModule comp_exists
-c1 {
-  instr = f32[1]{0} constant({12345})
-}
-c2 {
-  instr = f32[1]{0} constant({67890})
-})";
-
-  ExpectHasSubstr(Parse(original).status().error_message(),
-                  R"(was parsing 3:3: error: instruction previously defined here
-  instr = f32[1]{0} constant({12345})
-  ^)");
-}
-
 TEST_F(HloParserTest, ComputationExists) {
   const string original = R"(HloModule comp_exists
 comp {
@@ -1341,6 +1327,47 @@ comp {
                   R"(was parsing 2:1: error: computation previously defined here
 comp {
 ^)");
+}
+
+TEST_F(HloParserTest, CrossComputationLookup) {
+  const string original = R"(HloModule cross_computation_lookup:
+tcalla (a: (s32[], s32[])) -> (s32[], s32[]) {
+  ROOT aparam = (s32[], s32[]) parameter(0)
+}
+
+tcallb (b: (s32[], s32[])) -> s32[] {
+  rparam = (s32[], s32[]) parameter(0)
+  ROOT gte0 = s32[] get-tuple-element(aparam), index=0
+}
+
+ENTRY entry {
+  param = (s32[], s32[]) parameter(0)
+  call0 = (s32[], s32[]) call(param), to_apply=tcalla
+  ROOT call1 = s32[] call(param), to_apply=tcallb
+})";
+  ExpectHasSubstr(
+      Parse(original).status().error_message(),
+      "was parsing 8:39: error: instruction does not exist: aparam");
+}
+
+TEST_F(HloParserTest, ParseSharding) {
+  const string original = "{maximal device=42}";
+  TF_ASSERT_OK_AND_ASSIGN(HloSharding sharding, ParseSharding(original));
+  EXPECT_EQ(sharding.ToString(), original);
+}
+
+TEST_F(HloParserTest, ParseWindow) {
+  Window original = window_util::MakeWindow({1, 2, 3});
+  TF_ASSERT_OK_AND_ASSIGN(Window parsed,
+                          ParseWindow(window_util::ToString(original)))
+  EXPECT_EQ(window_util::ToString(original), window_util::ToString(parsed));
+}
+
+TEST_F(HloParserTest, ParseConvolutionDimensionNumbers) {
+  const string original = "b0f_0io->b0f";
+  TF_ASSERT_OK_AND_ASSIGN(ConvolutionDimensionNumbers dnums,
+                          ParseConvolutionDimensionNumbers(original));
+  EXPECT_EQ(original, ConvolutionDimensionNumbersToString(dnums));
 }
 
 }  // namespace
