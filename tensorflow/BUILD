@@ -27,24 +27,17 @@ exports_files([
 ])
 #通用方法，加载.bzl文件
 
-#Loading an extension
-#[Bazel extensions are files ending in .bzl.] 
-#Use the load statement to import a symbol from an extension.
-#load("//build_tools/rules:maprule.bzl", "maprule")
-#This code will load the file build_tools/rules/maprule.bzl and add the maprule symbol to the environment. 
-#This can be used to load new rules, functions or constants (e.g. a string, a list, etc.). 
-#Multiple symbols can be imported by using additional arguments to the call to load.
-#Arguments must be string literals (no variable) and load statements must appear at top-level, i.e. they cannot be in a function body.
-#The first argument of load is a label identifying a .bzl file. If it is a relative label,
-#it is resolved with respect to the package (not directory) containing the current .bzl file. 
-#Relative labels in load statements should use a leading :.
-#load also supports aliases, i.e. you can assign different names to the imported symbols.
-#load("//build_tools/rules:maprule.bzl", maprule_alias = "maprule")
-#You can define multiple aliases within one load statement. Moreover, the argument list can contain both aliases and regular symbol names.
-#The following example is perfectly legal (please note when to use quotation marks).
-#load(":my_rules.bzl", "some_rule", nice_alias = "some_other_rule")
-#In a .bzl file, symbols starting with _ are not exported and cannot be loaded from another file.
-#Visibility doesn't affect loading (yet): you don't need to use exports_files to make a .bzl file visible.
+#加载扩展
+#BAZEL扩展是在.bZL中结束的文件。使用Load语句从扩展中导入符号。
+#加载（“//BuffdIoToe/Stult:MultRealth.BZL”、“MultRealm”）
+#此代码将加载文件BuffdIoToStudio/Trave/MululeR.BZL，并将MaulRealm符号添加到环境中。这可以用来加载新的规则、函数或常量（例如字符串、列表等）。
+#多个符号可以通过使用附加参数加载到调用来导入。参数必须是字符串文字（无变量），并且加载语句必须出现在顶层，也就是说它们不能在函数体中。
+#Load的第一个参数是标识.bZL文件的标签。如果它是一个相对的标签，它就解决了包含当前.bZL文件的包（不是目录）。加载语句中的相对标签应该使用引号：。
+#Load还支持别名，即您可以为导入的符号分配不同的名称。
+#加载（“//BuffdIoToe/Stult:MultRealth.BZL”）、MaulReulyAuasas =“MultRealm”
+#可以在一个加载语句中定义多个别名。此外，参数列表可以包含别名和正则符号名称。下面的示例是完全合法的（请注意何时使用引号）。
+#加载（“MyOrthReals.bZL”，“Asth-OrthRead”，NeeGyAias＝“SothOxType规则”）
+#在.bZL文件中，从x开始的符号不导出，不能从另一个文件加载。可视性不影响加载（但）：您不需要使用ExpStsx文件来使.bZL文件可见
 
 
 load("//tensorflow:tensorflow.bzl", "tf_cc_shared_object")
