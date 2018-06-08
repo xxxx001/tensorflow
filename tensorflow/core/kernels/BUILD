@@ -417,7 +417,7 @@ tf_kernel_library(
         "//tensorflow/core:lib",
     ],
 )
-
+# c++库文件，name指定了编译为库文件后的文件名，srcs和hdrs指定源文件和头文件，deps指定需要依赖的其他文件
 cc_library(
     name = "save_restore_tensor",
     srcs = ["save_restore_tensor.cc"],

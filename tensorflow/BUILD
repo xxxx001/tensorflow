@@ -2,8 +2,20 @@
 # TensorFlow is a computational framework, primarily for use in machine
 # learning applications.
 
-package(default_visibility = [":internal"])
+#通用方法，定义的值会作用到下面的每个子rule中。default_visibility指定了这个包的默认可见规则。可见的情况下才能被其他package调用。
+#BUILD文件也是采用的类似Python的语法，它定义了编译规则，lib依赖等各项规则。其中有些命令专属于BUILD文件，有些则是bazel语法通用的，
+#如WORKSPACE文件中也可以使用。主要方法调用如下
+#tf_cc_binary：目标文件编译规则，为一个二进制可执行文件。name必须唯一，srcs指定了源文件，linkopts指定了链接规则，deps指定了依赖文件
+#cc_library：库文件编译规则，name指定了编译为库文件后的文件名，srcs和hdrs指定源文件和头文件，deps指定需要依赖的其他文件
+#tf_cc_test：测试文件规则
+#package：通用方法，定义的值会作用到下面的每个子rule中。default_visibility指定了这个包的默认可见规则。可见的情况下才能被其他package调用。
+#licenses：通用方法，默认的license
+#load：通用方法，加载.bzl文件
+#filegroup：通用方法，为多个编译目标target指定一个名字，glob是一个帮助函数，指定了目录中哪些文件会include，哪些会exclude。
+#visibility指定了target的可见性，也就是可以被哪些package调用
 
+package(default_visibility = [":internal"])
+# 默认的license
 licenses(["notice"])  # Apache 2.0
 
 exports_files([
@@ -13,6 +25,27 @@ exports_files([
     "leakr_badwords.dic",
     "leakr_badfiles.dic",
 ])
+#通用方法，加载.bzl文件
+
+#Loading an extension
+#[Bazel extensions are files ending in .bzl.] 
+#Use the load statement to import a symbol from an extension.
+#load("//build_tools/rules:maprule.bzl", "maprule")
+#This code will load the file build_tools/rules/maprule.bzl and add the maprule symbol to the environment. 
+#This can be used to load new rules, functions or constants (e.g. a string, a list, etc.). 
+#Multiple symbols can be imported by using additional arguments to the call to load.
+#Arguments must be string literals (no variable) and load statements must appear at top-level, i.e. they cannot be in a function body.
+#The first argument of load is a label identifying a .bzl file. If it is a relative label,
+#it is resolved with respect to the package (not directory) containing the current .bzl file. 
+#Relative labels in load statements should use a leading :.
+#load also supports aliases, i.e. you can assign different names to the imported symbols.
+#load("//build_tools/rules:maprule.bzl", maprule_alias = "maprule")
+#You can define multiple aliases within one load statement. Moreover, the argument list can contain both aliases and regular symbol names.
+#The following example is perfectly legal (please note when to use quotation marks).
+#load(":my_rules.bzl", "some_rule", nice_alias = "some_other_rule")
+#In a .bzl file, symbols starting with _ are not exported and cannot be loaded from another file.
+#Visibility doesn't affect loading (yet): you don't need to use exports_files to make a .bzl file visible.
+
 
 load("//tensorflow:tensorflow.bzl", "tf_cc_shared_object")
 load(
@@ -409,6 +442,8 @@ load(
     "//third_party/mkl:build_defs.bzl",
     "if_mkl",
 )
+# 为多个编译目标target指定一个名字，glob是一个帮助函数，指定了目录中哪些文件会include，哪些会exclude。
+#visibility指定了target的可见性，也就是可以被哪些package调用
 
 filegroup(
     name = "intel_binary_blob",
