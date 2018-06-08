@@ -94,6 +94,10 @@ class TocoConverter(object):
       created for any op that is unknown. The developer will need to provide
       these to the TensorFlow Lite runtime with a custom resolver.
       (default False)
+    quantize_weights: Boolean indicating whether to store weights as quantized
+      weights followed by dequantize operations. Computation is still done in
+      float, but reduces model size (at the cost of accuracy and latency).
+      (default False)
 
   Example usage:
 
@@ -135,6 +139,7 @@ class TocoConverter(object):
     self.reorder_across_fake_quant = False
     self.change_concat_input_ranges = False
     self.allow_custom_ops = False
+    self.quantize_weights = False
 
   @classmethod
   def from_session(cls, sess, input_tensors, output_tensors):
@@ -262,15 +267,19 @@ class TocoConverter(object):
 
     Raises:
       ValueError:
+        Input shape is not specified.
         None value for dimension in input_tensor.
     """
     # Checks dimensions in input tensor.
     for tensor in self._input_tensors:
+      if not tensor.get_shape():
+        raise ValueError("Provide an input shape for input array '{0}'.".format(
+            tensor_name(tensor)))
       shape = tensor.get_shape().as_list()
       if None in shape[1:]:
         raise ValueError(
             "None is only supported in the 1st dimension. Tensor '{0}' has "
-            "invalid shape '{1}'.".format(tensor.name, shape))
+            "invalid shape '{1}'.".format(tensor_name(tensor), shape))
       elif shape[0] is None:
         self._set_batch_size(batch_size=1)
 
@@ -306,8 +315,17 @@ class TocoConverter(object):
         drop_control_dependency=self.drop_control_dependency,
         reorder_across_fake_quant=self.reorder_across_fake_quant,
         change_concat_input_ranges=self.change_concat_input_ranges,
-        allow_custom_ops=self.allow_custom_ops)
+        allow_custom_ops=self.allow_custom_ops,
+        quantize_weights=self.quantize_weights)
     return result
+
+  def get_input_arrays(self):
+    """Returns a list of the names of the input tensors.
+
+    Returns:
+      List of strings.
+    """
+    return [tensor_name(tensor) for tensor in self._input_tensors]
 
   def _set_batch_size(self, batch_size):
     """Sets the first dimension of the input tensor to `batch_size`.

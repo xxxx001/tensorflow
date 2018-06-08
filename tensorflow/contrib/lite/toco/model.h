@@ -136,6 +136,8 @@ enum class OperatorType {
   kReorderAxes,
   kSelect,
   kSparseToDense,
+  kTensorFlowEqual,
+  kTensorFlowNotEqual,
 };
 
 // Helper to deal with TensorFlow arrays using a different ordering of
@@ -527,7 +529,15 @@ struct LstmCellOperator : Operator {
     ACTIV_TEMP = 3,
     NUM_OUTPUTS = 4
   };
-  LstmCellOperator() : Operator(OperatorType::kLstmCell) {}
+  enum KernelType {
+    KERNEL_BASIC = 0,
+    KERNEL_FULL = 1,
+  };
+
+  LstmCellOperator()
+      : Operator(OperatorType::kLstmCell), kernel_type(KERNEL_BASIC) {}
+
+  KernelType kernel_type;
 };
 
 // Element-wise multiplication operator.
@@ -1348,6 +1358,22 @@ struct TensorFlowGreaterOperator : Operator {
 struct TensorFlowGreaterEqualOperator : Operator {
   TensorFlowGreaterEqualOperator()
       : Operator(OperatorType::kTensorFlowGreaterEqual) {}
+};
+
+// TensorFlow Equal equivalent. Refer to TensorFlow documentation for
+// details.
+// Not fully supported, just a placeholder to handle TensorFlow graphs and
+// support graph transformations to other operator types by matching sub-graphs.
+// Typically, this is only used as an input to an Assert node, so can be
+// removed as an unused node as we drop Assert nodes.
+struct TensorFlowEqualOperator : Operator {
+  TensorFlowEqualOperator() : Operator(OperatorType::kTensorFlowEqual) {}
+};
+
+// TensorFlow Not Equal equivalent. Refer to TensorFlow documentation for
+// details.
+struct TensorFlowNotEqualOperator : Operator {
+  TensorFlowNotEqualOperator() : Operator(OperatorType::kTensorFlowNotEqual) {}
 };
 
 // Global max reduction: computes the max of all of entries in the input array.
