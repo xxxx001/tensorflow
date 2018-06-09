@@ -14,6 +14,11 @@
 #filegroup：通用方法，为多个编译目标target指定一个名字，glob是一个帮助函数，指定了目录中哪些文件会include，哪些会exclude。
 #visibility指定了target的可见性，也就是可以被哪些package调用
 
+
+#rule *_binary rules  ,[1] ,*_test rules,[2], *_library rules[3]    specify separately-compiled modules
+
+#Visibility ://visibility:public  ,,,Prefer using __pkg__ to __subpackages__.
+
 package(default_visibility = [":internal"])
 # 默认的license
 licenses(["notice"])  # Apache 2.0
