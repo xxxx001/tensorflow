@@ -73,11 +73,8 @@ void Worker::RegisterGraphAsync(const RegisterGraphRequest* request,
     s = session->graph_mgr->Register(
         request->session_handle(), request->graph_def(),
         request->graph_options(), request->debug_options(),
-<<<<<<< HEAD
-        request->collective_graph_key(),session->cluster_flr.get(), 
-=======
         request->collective_graph_key(), session->cluster_flr.get(),
->>>>>>> 928e8b95cc82f42884840c8f126d81dcc37f4c80
+
         response->mutable_graph_handle());
   }
   done(s);
