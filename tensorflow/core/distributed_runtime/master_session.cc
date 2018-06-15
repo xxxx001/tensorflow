@@ -69,6 +69,7 @@ class MasterSession::ReffedClientGraph : public core::RefCounted {
                     bool is_partial, WorkerCacheInterface* worker_cache,
                     bool should_deregister)
       : session_handle_(handle),
+       bg_opts_(bopts),
         client_graph_(std::move(cg)),
         session_opts_(session_opts),
         is_partial_(is_partial),

@@ -27,6 +27,9 @@ class CollectiveExecutorMgr : public CollectiveExecutorMgrInterface {
   CollectiveExecutorMgr(const ConfigProto& config, const DeviceMgr* dev_mgr,
                         DeviceResolverInterface* dev_resolver,
                         ParamResolverInterface* param_resolver);
+  CollectiveExecutorMgr(const ConfigProto& config, const DeviceMgr* dev_mgr,
+-                       std::unique_ptr<DeviceResolverInterface> dev_resolver,
+-                       std::unique_ptr<ParamResolverInterface> param_resolver);
 
   virtual ~CollectiveExecutorMgr();
 
@@ -54,6 +57,8 @@ class CollectiveExecutorMgr : public CollectiveExecutorMgrInterface {
   }
 
   void RetireStepId(int64 graph_key, int64 step_id) override {}
+  virtual CollectiveExecutor* Create(int64 step_id);
+
 
  protected:
   const DeviceMgr* dev_mgr_;

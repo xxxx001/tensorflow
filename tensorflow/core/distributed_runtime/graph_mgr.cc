@@ -283,8 +283,13 @@ Status GraphMgr::Register(const string& session, const GraphDef& gdef,
                           DistributedFunctionLibraryRuntime* cluster_flr,
                           string* handle) {
   Item* item = new Item;
-  Status s =
-      InitItem(session, gdef, graph_options, debug_options, cluster_flr, item);
+ // Status s =
+ //     InitItem(session, gdef, graph_options, debug_options, cluster_flr, item);
+
+	  Status s = InitItem(session, gdef, graph_options, debug_options,
+	  	collective_graph_key, cluster_flr, item);
+
+	  
   if (!s.ok()) {
     item->Unref();
     return s;
@@ -436,17 +441,19 @@ void GraphMgr::ExecuteAsync(const string& handle, const int64 step_id,
     return;
   }
 
-  StartParallelExecutors(handle, step_id, item, rendezvous, collector,
+  StartParallelExecutors(handle, step_id, item, rendezvous, ce_handle, collector,
                          cost_graph, cancellation_manager,
-                         [item, rendezvous, done](const Status& s) {
+                         [item, rendezvous,ce_handle, done](const Status& s) {
                            done(s);
                            rendezvous->Unref();
                            item->Unref();
+						   delete ce_handle;
                          });
 }
 
 void GraphMgr::StartParallelExecutors(const string& handle, int64 step_id,
                                       Item* item, Rendezvous* rendezvous,
+                                       CollectiveExecutor::Handle* ce_handle,
                                       StepStatsCollector* collector,
                                       CostGraphDef* cost_graph,
                                       CancellationManager* cancellation_manager,

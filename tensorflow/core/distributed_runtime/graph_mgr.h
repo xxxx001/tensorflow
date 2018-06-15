@@ -75,7 +75,7 @@ class GraphMgr {
   // reference to cluster_flr to do cross process function calls.
   Status Register(const string& session, const GraphDef& gdef,
                   const GraphOptions& graph_options,
-                  const DebugOptions& debug_options,
+                  const DebugOptions& debug_options,int64 collective_graph_key,
                   DistributedFunctionLibraryRuntime* cluster_flr,
                   string* handle);
 

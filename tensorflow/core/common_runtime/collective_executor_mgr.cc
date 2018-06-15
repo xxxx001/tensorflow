@@ -31,11 +31,45 @@ CollectiveExecutorMgr::CollectiveExecutorMgr(
       dev_resolver_(dev_resolver),
       param_resolver_(param_resolver) {}
 
+CollectiveExecutorMgr::CollectiveExecutorMgr(
+	const ConfigProto& config, const DeviceMgr* dev_mgr,
+	const ConfigProto& config, const DeviceMgr* dev_mgr,
+	std::unique_ptr<DeviceResolverInterface> dev_resolver,
+	std::unique_ptr<ParamResolverInterface> param_resolver)
+	: dev_mgr_(dev_mgr), 	
+	  dev_resolver_(std::move(dev_resolver)),
+	  param_resolver_(std::move(param_resolver)) {}
+
+	  
+
 CollectiveExecutorMgr::~CollectiveExecutorMgr() {
   for (auto iter : executor_table_) {
-    iter.second->Unref();
+   // iter.second->Unref();
+	if (it != executor_table_.end()) {
+       ce = it->second;		
+     } else {           
+	   ce = Create(step_id);  
+
+	   
+       executor_table_[step_id] = ce;		
+     }		    
+     ce->Ref();	
+  
   }
 }
+
+
+
+
+
+
+CollectiveExecutor* CollectiveExecutorMgr::Create(int64 step_id) {
+  CollectiveRemoteAccessLocal* rma =
+      new CollectiveRemoteAccessLocal(dev_mgr_, dev_resolver_.get(), step_id);
+  return new BaseCollectiveExecutor(this, rma, step_id, dev_mgr_);
+}
+
+
 
 CollectiveExecutor* CollectiveExecutorMgr::FindOrCreate(int64 step_id) {
   CollectiveExecutor* ce = nullptr;

@@ -270,6 +270,22 @@ OpKernelContext::OpKernelContext(Params* params, int num_outputs)
   if (params_->record_tensor_accesses) {
     referenced_tensors_.Init();
   }
+//
+if (params->device->has_eigen_cpu_device()) {
+    int64 block_size = -1, output_size = -1, num_threads = 1;
+    const Eigen::ThreadPoolDevice* thread_pool =
+        params_->device->eigen_cpu_device();
+    AttrSlice attributes(op_kernel().def());
+    if (GetNodeAttr(attributes, "_block_size", &block_size) == Status::OK() &&
+        GetNodeAttr(attributes, "_output_size", &output_size) == Status::OK()) {
+      num_threads = std::min(Eigen::divup(output_size, block_size),
+                             static_cast<int64>(thread_pool->numThreads()));
+      eigen_cpu_device_ = MakeUnique<Eigen::ThreadPoolDevice>(
+          thread_pool->getPool(), num_threads);
+    }
+  }
+
+  
 }
 
 OpKernelContext::~OpKernelContext() {

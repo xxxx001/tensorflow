@@ -510,6 +510,9 @@ tf_cc_shared_object(
 # an "-exported_symbols_list" command.  -z defs disallows undefined
 # symbols in object files.
 
+//copts = ["-Iexternal/gtest/include"],  链接第三方头文件
+//    linkopts = ["-pthread"],     链接库
+
 tf_cc_shared_object(
     name = "libtensorflow.so",
     linkopts = select({
@@ -572,7 +575,7 @@ exports_files(
 )
 
 gen_api_init_files(
-    name = "python_api_gen",
+    name = "tensorflow_python_api_gen",
     srcs = ["api_template.__init__.py"],
     root_init_template = "api_template.__init__.py",
 )

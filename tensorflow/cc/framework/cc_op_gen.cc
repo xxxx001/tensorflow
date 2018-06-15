@@ -273,6 +273,15 @@ string PrintAttrValue(const string& op, const AttrValue& attr_value) {
   return "<Unknown AttrValue type>";  // Prevent missing return warning
 }
 
+
+bool IsEmptyList(const AttrValue::ListValue& list) {
+  return list.s_size() == 0 && list.i_size() == 0 && list.f_size() == 0 &&
+         list.b_size() == 0 && list.type_size() == 0 &&
+         list.shape_size() == 0 && list.tensor_size() == 0;
+}
+
+
+
 string ToCamelCase(const string& str) {
   string result;
   const char joiner = '_';
@@ -324,6 +333,29 @@ std::pair<const char*, bool> AttrTypeName(StringPiece attr_type) {
   }
   return entry->second;
 }
+
+
+const char* ListElementTypeName(StringPiece attr_type) {
+  static const auto* attr_list_type_map =
+      new std::unordered_map<StringPiece, const char*, StringPieceHasher>{
+          {"list(string)", "string"},
+          {"list(int)", "int"},
+          {"list(float)", "float"},
+          {"list(bool)", "bool"},
+          {"list(type)", "DataType"},
+          {"list(shape)", "PartialTensorShape"},
+          {"list(tensor)", "TensorProto"},
+      };
+
+  auto entry = attr_list_type_map->find(attr_type);
+  if (entry == attr_list_type_map->end()) {
+    LOG(FATAL) << "Unsupported or non-list Attr type: " << attr_type;
+    return "";
+  }
+  return entry->second;
+}
+
+
 
 bool IsCPPKeyword(StringPiece name) {
   static const std::unordered_set<StringPiece, StringPieceHasher>

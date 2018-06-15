@@ -72,7 +72,8 @@ void Worker::RegisterGraphAsync(const RegisterGraphRequest* request,
     s = session->graph_mgr->Register(
         request->session_handle(), request->graph_def(),
         request->graph_options(), request->debug_options(),
-        session->cluster_flr.get(), response->mutable_graph_handle());
+        request->collective_graph_key(),session->cluster_flr.get(), 
+        response->mutable_graph_handle());
   }
   done(s);
 }
@@ -314,6 +315,12 @@ void Worker::CleanupGraphAsync(const CleanupGraphRequest* request,
   env_->rendezvous_mgr->Cleanup(step_id);
   if (env_->collective_executor_mgr) {
     env_->collective_executor_mgr->Cleanup(step_id);
+  }
+  for (Device* d : env_->local_devices) {
+    ScopedAllocatorMgr* sam = d->GetScopedAllocatorMgr();
+    if (sam) {
+      sam->Cleanup(step_id);
+    }
   }
   done(Status::OK());
 }
