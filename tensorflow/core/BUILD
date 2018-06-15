@@ -3460,6 +3460,36 @@ tf_cc_tests(
     ],
 )
 
+tf_cc_test(
+      name = "tensorX" ,
+      size= "small",
+      srcs = [
+           "framework/tensor_test.cc" ,
+       ],
+      deps = [
+         ":core",
+         ":core_cpu",
+         ":framework",
+         ":framework_internal",
+         ":lib",
+         ":lib_internal",
+         ":test",
+         ":test_main",
+      
+          "//tensorflow/cc:cc_ops",
+        "//tensorflow/cc:cc_ops_internal",
+        "//tensorflow/cc:function_ops",
+        "//tensorflow/cc:ops",
+        "//tensorflow/cc:scope",
+        "//tensorflow/cc:sendrecv_ops",
+        "//tensorflow/cc:while_loop",
+        "//tensorflow/core/kernels:ops_util",
+        "//third_party/eigen3",
+
+     ],
+
+)
+
 tf_cc_tests(
     name = "higher_level_tests_needing_kernels",
     size = "small",

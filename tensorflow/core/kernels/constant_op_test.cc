@@ -12,7 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-
+//#include <iostream>
 #include "tensorflow/core/common_runtime/kernel_benchmark_testlib.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/op.h"
@@ -40,7 +40,8 @@ void ConstantOpTest::PersistentMemoryTrackingTest(bool on_gpu) {
   for (int i = 0; i < 2 * 3 * 4 * 5; ++i) {
     tensor.flat<int32>()(i) = i;
   }
-
+  std::cout<<"tensor:"<<  std::endl;
+   printf("ConstantOptTest:: PersistenetMemoryTranckingTest.....\n");
   NodeDef const_node;
   TF_ASSERT_OK(NodeDefBuilder("some_node", "Const")
                    .Attr("dtype", data_type)
