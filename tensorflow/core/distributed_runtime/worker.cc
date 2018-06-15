@@ -18,6 +18,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/collective_executor_mgr.h"
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/process_util.h"
+#include "tensorflow/core/common_runtime/scoped_allocator_mgr.h"
 #include "tensorflow/core/common_runtime/step_stats_collector.h"
 #include "tensorflow/core/distributed_runtime/rendezvous_mgr_interface.h"
 #include "tensorflow/core/distributed_runtime/tensor_coding.h"
@@ -72,7 +73,11 @@ void Worker::RegisterGraphAsync(const RegisterGraphRequest* request,
     s = session->graph_mgr->Register(
         request->session_handle(), request->graph_def(),
         request->graph_options(), request->debug_options(),
+<<<<<<< HEAD
         request->collective_graph_key(),session->cluster_flr.get(), 
+=======
+        request->collective_graph_key(), session->cluster_flr.get(),
+>>>>>>> 928e8b95cc82f42884840c8f126d81dcc37f4c80
         response->mutable_graph_handle());
   }
   done(s);

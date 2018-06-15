@@ -1,4 +1,5 @@
 /* Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+<<<<<<< HEAD
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
 +you may not use this file except in compliance with the License.
@@ -12,6 +13,21 @@
 +See the License for the specific language governing permissions and
 +limitations under the License.
 +==============================================================================*/
+=======
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+>>>>>>> 928e8b95cc82f42884840c8f126d81dcc37f4c80
 #include "tensorflow/core/distributed_runtime/rpc_collective_executor_mgr.h"
 
 #include "tensorflow/core/common_runtime/base_collective_executor.h"
@@ -140,4 +156,7 @@ void RpcCollectiveExecutorMgr::RetireStepId(int64 graph_key, int64 step_id) {
 }
 
 }  // namespace tensorflow
+<<<<<<< HEAD
 
+=======
+>>>>>>> 928e8b95cc82f42884840c8f126d81dcc37f4c80
