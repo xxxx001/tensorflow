@@ -2,8 +2,25 @@
 # TensorFlow is a computational framework, primarily for use in machine
 # learning applications.
 
-package(default_visibility = [":internal"])
+#通用方法，定义的值会作用到下面的每个子rule中。default_visibility指定了这个包的默认可见规则。可见的情况下才能被其他package调用。
+#BUILD文件也是采用的类似Python的语法，它定义了编译规则，lib依赖等各项规则。其中有些命令专属于BUILD文件，有些则是bazel语法通用的，
+#如WORKSPACE文件中也可以使用。主要方法调用如下
+#tf_cc_binary：目标文件编译规则，为一个二进制可执行文件。name必须唯一，srcs指定了源文件，linkopts指定了链接规则，deps指定了依赖文件
+#cc_library：库文件编译规则，name指定了编译为库文件后的文件名，srcs和hdrs指定源文件和头文件，deps指定需要依赖的其他文件
+#tf_cc_test：测试文件规则
+#package：通用方法，定义的值会作用到下面的每个子rule中。default_visibility指定了这个包的默认可见规则。可见的情况下才能被其他package调用。
+#licenses：通用方法，默认的license
+#load：通用方法，加载.bzl文件
+#filegroup：通用方法，为多个编译目标target指定一个名字，glob是一个帮助函数，指定了目录中哪些文件会include，哪些会exclude。
+#visibility指定了target的可见性，也就是可以被哪些package调用
 
+
+#rule *_binary rules  ,[1] ,*_test rules,[2], *_library rules[3]    specify separately-compiled modules
+
+#Visibility ://visibility:public  ,,,Prefer using __pkg__ to __subpackages__.
+
+package(default_visibility = [":internal"])
+# 默认的license
 licenses(["notice"])  # Apache 2.0
 
 exports_files([
@@ -13,6 +30,20 @@ exports_files([
     "leakr_badwords.dic",
     "leakr_badfiles.dic",
 ])
+#通用方法，加载.bzl文件
+
+#加载扩展
+#BAZEL扩展是在.bZL中结束的文件。使用Load语句从扩展中导入符号。
+#加载（“//BuffdIoToe/Stult:MultRealth.BZL”、“MultRealm”）
+#此代码将加载文件BuffdIoToStudio/Trave/MululeR.BZL，并将MaulRealm符号添加到环境中。这可以用来加载新的规则、函数或常量（例如字符串、列表等）。
+#多个符号可以通过使用附加参数加载到调用来导入。参数必须是字符串文字（无变量），并且加载语句必须出现在顶层，也就是说它们不能在函数体中。
+#Load的第一个参数是标识.bZL文件的标签。如果它是一个相对的标签，它就解决了包含当前.bZL文件的包（不是目录）。加载语句中的相对标签应该使用引号：。
+#Load还支持别名，即您可以为导入的符号分配不同的名称。
+#加载（“//BuffdIoToe/Stult:MultRealth.BZL”）、MaulReulyAuasas =“MultRealm”
+#可以在一个加载语句中定义多个别名。此外，参数列表可以包含别名和正则符号名称。下面的示例是完全合法的（请注意何时使用引号）。
+#加载（“MyOrthReals.bZL”，“Asth-OrthRead”，NeeGyAias＝“SothOxType规则”）
+#在.bZL文件中，从x开始的符号不导出，不能从另一个文件加载。可视性不影响加载（但）：您不需要使用ExpStsx文件来使.bZL文件可见
+
 
 load("//tensorflow:tensorflow.bzl", "tf_cc_shared_object")
 load(
@@ -409,6 +440,8 @@ load(
     "//third_party/mkl:build_defs.bzl",
     "if_mkl",
 )
+# 为多个编译目标target指定一个名字，glob是一个帮助函数，指定了目录中哪些文件会include，哪些会exclude。
+#visibility指定了target的可见性，也就是可以被哪些package调用
 
 filegroup(
     name = "intel_binary_blob",
