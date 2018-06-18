@@ -13,14 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#define EIGEN_USE_THREADS
 #include "tensorflow/core/framework/op_kernel.h"
 
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/attr_value_util.h"
 #include "tensorflow/core/framework/device_attributes.pb.h"
 #include "tensorflow/core/framework/graph.pb_text.h"
@@ -42,7 +40,6 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/util/ptr_util.h"
 
 namespace tensorflow {
 
@@ -273,12 +270,8 @@ OpKernelContext::OpKernelContext(Params* params, int num_outputs)
   if (params_->record_tensor_accesses) {
     referenced_tensors_.Init();
   }
-<<<<<<< HEAD
 //
-if (params->device->has_eigen_cpu_device()) {
-=======
   if (params->device->has_eigen_cpu_device()) {
->>>>>>> 928e8b95cc82f42884840c8f126d81dcc37f4c80
     int64 block_size = -1, output_size = -1, num_threads = 1;
     const Eigen::ThreadPoolDevice* thread_pool =
         params_->device->eigen_cpu_device();
@@ -291,11 +284,7 @@ if (params->device->has_eigen_cpu_device()) {
           thread_pool->getPool(), num_threads);
     }
   }
-<<<<<<< HEAD
 
-  
-=======
->>>>>>> 928e8b95cc82f42884840c8f126d81dcc37f4c80
 }
 
 OpKernelContext::~OpKernelContext() {

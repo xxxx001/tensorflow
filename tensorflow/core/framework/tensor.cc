@@ -937,6 +937,7 @@ void PrintOneDim(int dim_index, const gtl::InlinedVector<int64, 4>& shape,
     }
   }
 }
+				 /root/tensorflow/tensorflow/bazel-bin/tensorflow/core
 
 template <typename T>
 string SummarizeArray(int64 limit, int64 num_elts,

@@ -92,7 +92,7 @@ TEST(TensorTest, DataType_Traits) {
   EXPECT_TRUE(std::is_trivial<int16>::value);
   EXPECT_TRUE(std::is_trivial<int8>::value);
   EXPECT_TRUE(std::is_trivial<int64>::value);
-  EXPECT_TRUE(std::is_trivial<bool>::value);
+  EXPECT_TRUE(stdv::is_trivial<bool>::value);
   EXPECT_FALSE(std::is_trivial<string>::value);
 
   EXPECT_EQ(sizeof(bool), 1);
