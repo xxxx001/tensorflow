@@ -3464,6 +3464,66 @@ tf_cc_tests(
         "//third_party/eigen3",
     ],
 )
+cc_library(
+    name = "tensor",
+    srcs = [ "framework/tensor.cc" , ],
+    hdrs = [ "framework/tensor.h" ,] ,
+    deps = [
+          ":core",
+          ":core_cpu",
+          ":framework",
+          ":framework_internal",
+          ":lib",
+          ":lib_internal",
+          ":ops",
+          ":protos_all_cc",
+          ":protos_test_cc",
+          "//tensorflow/cc:cc_ops",
+         "//tensorflow/cc:cc_ops_internal",
+         "//tensorflow/cc:function_ops",
+         "//tensorflow/cc:ops",
+         "//tensorflow/cc:scope",
+         "//tensorflow/cc:sendrecv_ops",
+         "//tensorflow/cc:while_loop",
+         "//tensorflow/core/kernels:ops_util",
+         "//third_party/eigen3",
+      ],
+
+)
+
+tf_cc_test(
+      name = "tensor_test" ,
+      size= "small",
+      srcs = [
+           "framework/tensor_test.cc" ,
+       ],
+      deps = [
+         ":tensor",
+         ":core",
+         ":core_cpu",
+         ":framework",
+         ":framework_internal",
+         ":lib",
+         ":lib_internal",
+         ":ops",
+         ":protos_all_cc",
+         ":protos_test_cc",
+         ":test",
+         ":test_main",
+         ":testlib",
+         "//tensorflow/cc:cc_ops",
+        "//tensorflow/cc:cc_ops_internal",
+        "//tensorflow/cc:function_ops",
+        "//tensorflow/cc:ops",
+        "//tensorflow/cc:scope",
+        "//tensorflow/cc:sendrecv_ops",
+        "//tensorflow/cc:while_loop",
+        "//tensorflow/core/kernels:ops_util",
+        "//third_party/eigen3",
+
+     ],
+
+)
 
 tf_cc_tests(
     name = "higher_level_tests_needing_kernels",
