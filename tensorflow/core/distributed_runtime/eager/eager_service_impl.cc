@@ -23,6 +23,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/process_util.h"
 #include "tensorflow/core/distributed_runtime/rpc/rpc_rendezvous_mgr.h"
 #include "tensorflow/core/distributed_runtime/server_lib.h"
+#include "tensorflow/core/distributed_runtime/session_mgr.h"
 #include "tensorflow/core/distributed_runtime/worker_cache.h"
 #include "tensorflow/core/distributed_runtime/worker_cache_wrapper.h"
 #include "tensorflow/core/distributed_runtime/worker_env.h"
@@ -80,11 +81,12 @@ Status GetNumRetvals(tensorflow::EagerContext* context, const string& op_name,
 
 Status EagerServiceImpl::CreateContext(const CreateContextRequest* request,
                                        CreateContextResponse* response) {
+  //make sure env_ , env_->rendezvous_mgr available
   if (env_ == nullptr || env_->rendezvous_mgr == nullptr) {
-    return InvalidArgument("invalid env  or rendezvous_mgr.");
-  }    
-  tensorflow::RemoteRendezvous* r = env_->rendezvous_mgr->Find(0);
+    return tensorflow::errors::Internal("invalid eager env_ or env_->rendezvous_mgr.");
+  } 
   std::vector<tensorflow::Device*> devices;
+
   TF_RETURN_IF_ERROR(tensorflow::DeviceFactory::AddDevices(
       // TODO(nareshmodi): Correctly set the SessionOptions.
       SessionOptions(),
@@ -92,7 +94,6 @@ Status EagerServiceImpl::CreateContext(const CreateContextRequest* request,
                       request->server_def().job_name().data(),
                       request->server_def().task_index()),
       &devices));
-
   response->mutable_device_attributes()->Reserve(devices.size());
   for (auto& d : devices) {
     *response->add_device_attributes() = d->attributes();
@@ -100,6 +101,19 @@ Status EagerServiceImpl::CreateContext(const CreateContextRequest* request,
 
   std::unique_ptr<tensorflow::DeviceMgr> device_mgr(
       new tensorflow::DeviceMgr(devices));
+
+  auto* r = env_->rendezvous_mgr->Find(request->rendezvous_id());
+  auto session_name = strings::StrCat("eager_", request->rendezvous_id());
+  TF_RETURN_IF_ERROR(env_->session_mgr->CreateSession(
+      session_name, request->server_def(), true));
+
+  std::shared_ptr<WorkerSession> worker_session;
+  TF_RETURN_IF_ERROR(env_->session_mgr->WorkerSessionForSession(
+      session_name, &worker_session));
+
+  // Initialize remote tensor communication based on worker session.
+  TF_RETURN_IF_ERROR(r->Initialize(worker_session.get()));
+
   std::unique_ptr<tensorflow::EagerContext> ctx(new tensorflow::EagerContext(
       SessionOptions(),
       tensorflow::ContextDevicePlacementPolicy::DEVICE_PLACEMENT_SILENT,
@@ -251,6 +265,27 @@ tensorflow::Status EagerServiceImpl::GetServerContext(
   (*server_context)->Ref();
   return Status::OK();
 }
+EagerServiceImplEx:: EagerServiceImplEx(const WorkerEnv* env_) :rendezvous_mgr_(env_), EagerServiceImpl(env_) {
 
+   worker_env_ = const_cast<WorkerEnv*>(env_) ;
+   worker_env_->env = Env::Default();
+   worker_env_->rendezvous_mgr = &rendezvous_mgr_;
+   session_mgr_ = std::unique_ptr<SessionMgr>(new SessionMgr(
+            worker_env_, "/job:localhost/replica:0/task:0/device:CPU:0",
+            std::unique_ptr<WorkerCacheInterface>(),
+            [](const ServerDef& server_def,
+               WorkerCacheInterface** worker_cache) {
+              *worker_cache = nullptr;
+              return Status::OK();
+            })) ;
+    worker_env_->session_mgr = session_mgr_.get();
+    Device* device = DeviceFactory::NewDevice(
+        "CPU", {}, "/job:localhost/replica:0/task:0/device:CPU:0");
+
+    worker_env_->local_devices = {device};
+    device_mgr_.reset(new DeviceMgr(worker_env_->local_devices));
+    worker_env_->device_mgr = device_mgr_.get();
+ 
+}
 }  // namespace eager
 }  // namespace tensorflow
