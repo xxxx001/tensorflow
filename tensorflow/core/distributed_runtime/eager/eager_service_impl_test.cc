@@ -20,15 +20,16 @@ limitations under the License.
 #include "tensorflow/c/c_api_internal.h"
 #include "tensorflow/core/common_runtime/eager/tensor_handle.h"
 #include "tensorflow/core/distributed_runtime/rpc/rpc_rendezvous_mgr.h"
+#include "tensorflow/core/distributed_runtime/session_mgr.h"
 #include "tensorflow/core/distributed_runtime/worker_env.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
+#include "tensorflow/core/lib/random/random.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/protobuf.h"
 #include "tensorflow/core/platform/test.h"
-#include "tensorflow/core/platform/test_benchmark.h"
 #include "tensorflow/core/protobuf/eager_service.pb.h"
 #include "tensorflow/core/protobuf/tensorflow_server.pb.h"
 
@@ -48,6 +49,45 @@ class TestEagerServiceImpl : public EagerServiceImpl {
 
     return context->GetTensorHandle(remote_handle, handle);
   }
+};
+
+class TestEagerServiceImplEx : public EagerServiceImplEx {
+ public:
+  explicit TestEagerServiceImplEx(const  WorkerEnv* rm) : EagerServiceImplEx(rm) {
+ }
+};
+
+class EagerServiceImplTest : public ::testing::Test {
+ public:
+  EagerServiceImplTest()
+      : rendezvous_mgr_(&worker_env_),
+        session_mgr_(new SessionMgr(
+            &worker_env_, "/job:localhost/replica:0/task:0/device:CPU:0",
+            std::unique_ptr<WorkerCacheInterface>(),
+            [](const ServerDef& server_def,
+               WorkerCacheInterface** worker_cache) {
+              *worker_cache= nullptr;
+              return Status::OK();
+            })) {
+    worker_env_.env = Env::Default();
+
+    worker_env_.rendezvous_mgr = &rendezvous_mgr_;
+    worker_env_.session_mgr = session_mgr_.get();
+
+    Device* device = DeviceFactory::NewDevice(
+        "CPU", {}, "/job:localhost/replica:0/task:0/device:CPU:0");
+
+    worker_env_.local_devices = {device};
+
+    device_mgr_.reset(new DeviceMgr(worker_env_.local_devices));
+    worker_env_.device_mgr = device_mgr_.get();
+  }
+
+ protected:
+  WorkerEnv worker_env_;
+  tensorflow::RpcRendezvousMgr rendezvous_mgr_;
+  std::unique_ptr<SessionMgr> session_mgr_;
+  std::unique_ptr<DeviceMgr> device_mgr_;
 };
 
 void SetTensorProto(AttrValue* val) {
@@ -118,18 +158,15 @@ tensorflow::FunctionDef MatMulFunction() {
   return def;
 }
 
-// Test creates a context and attempts to execute some ops.
-TEST(EagerServiceImplTest, BasicTest) {
-  WorkerEnv worker_env;
-  worker_env.env = Env::Default();
-  tensorflow::RpcRendezvousMgr rm(&worker_env);
-  worker_env.rendezvous_mgr = &rm;
 
-  TestEagerServiceImpl eager_service_impl(&worker_env);
+TEST(EagerServiceImplTestEx, BasicTest0) {
+  WorkerEnv worker_env_;
+  TestEagerServiceImplEx eager_service_impl(&worker_env_);
 
   CreateContextRequest request;
   request.mutable_server_def()->set_job_name("localhost");
   request.mutable_server_def()->set_task_index(0);
+  request.set_rendezvous_id(random::New64());
   CreateContextResponse response;
 
   TF_ASSERT_OK(eager_service_impl.CreateContext(&request, &response));
@@ -192,19 +229,90 @@ TEST(EagerServiceImplTest, BasicTest) {
   TF_ASSERT_OK(eager_service_impl.CloseContext(&close_context_request,
                                                &close_context_response));
 }
-
-// Test creates a context and attempts to execute a function.
-TEST(EagerServiceImplTest, BasicFunctionTest) {
-  WorkerEnv worker_env;
-  worker_env.env = Env::Default();
-  tensorflow::RpcRendezvousMgr rm(&worker_env);
-  worker_env.rendezvous_mgr = &rm;
-
-  TestEagerServiceImpl eager_service_impl(&worker_env);
+// Test creates a context and attempts to execute some ops.
+TEST_F(EagerServiceImplTest, BasicTest) {
+  TestEagerServiceImpl eager_service_impl(&worker_env_);
 
   CreateContextRequest request;
   request.mutable_server_def()->set_job_name("localhost");
   request.mutable_server_def()->set_task_index(0);
+  request.set_rendezvous_id(random::New64());
+  CreateContextResponse response;
+
+  TF_ASSERT_OK(eager_service_impl.CreateContext(&request, &response));
+
+  uint64 context_id = response.context_id();
+
+  EnqueueRequest remote_enqueue_request;
+  remote_enqueue_request.set_context_id(context_id);
+  EnqueueResponse remote_enqueue_response;
+
+  std::unordered_map<string, AttrValue> const_attrs;
+  AttrValue val;
+  val.set_type(tensorflow::DataType::DT_FLOAT);
+  const_attrs.insert({"dtype", val});
+  val.Clear();
+  SetTensorProto(&val);
+  const_attrs.insert({"value", val});
+
+  AddOperationToEnqueueRequest(1, "Const", {}, const_attrs,
+                               "/job:localhost/replica:0/task:0/device:CPU:0",
+                               &remote_enqueue_request);
+
+  std::unordered_map<string, AttrValue> attrs;
+  val.Clear();
+  val.set_type(tensorflow::DataType::DT_FLOAT);
+  attrs.insert({"T", val});
+  val.Clear();
+  val.set_b(false);
+  attrs.insert({"transpose_a", val});
+  attrs.insert({"transpose_b", val});
+
+  AddOperationToEnqueueRequest(2, "MatMul", {{1, 0}, {1, 0}}, attrs,
+                               "/job:localhost/replica:0/task:0/device:CPU:0",
+                               &remote_enqueue_request);
+
+  TF_ASSERT_OK(eager_service_impl.Enqueue(&remote_enqueue_request,
+                                          &remote_enqueue_response));
+
+  auto& matmul_result_shape =
+      remote_enqueue_response.queue_response(1).shape(0);
+  EXPECT_EQ(matmul_result_shape.dim(0).size(), 2);
+  EXPECT_EQ(matmul_result_shape.dim(1).size(), 2);
+
+  tensorflow::TensorHandle* tensor_handle;
+  TF_ASSERT_OK(eager_service_impl.GetTensorHandle(
+      response.context_id(), RemoteTensorHandleInternal(2, 0), &tensor_handle));
+
+  // This should be OK to do since we've placed all computation on the CPU
+  // device.
+  const tensorflow::Tensor* t = nullptr;
+  TF_ASSERT_OK(tensor_handle->Tensor(&t));
+
+  auto actual = t->flat<float>();
+
+  EXPECT_EQ(4, actual.size());
+
+  EXPECT_EQ(7, actual(0));
+  EXPECT_EQ(10, actual(1));
+  EXPECT_EQ(15, actual(2));
+  EXPECT_EQ(22, actual(3));
+
+  CloseContextRequest close_context_request;
+  close_context_request.set_context_id(context_id);
+  CloseContextResponse close_context_response;
+  TF_ASSERT_OK(eager_service_impl.CloseContext(&close_context_request,
+                                               &close_context_response));
+}
+
+// Test creates a context and attempts to execute a function.
+TEST_F(EagerServiceImplTest, BasicFunctionTest) {
+  TestEagerServiceImpl eager_service_impl(&worker_env_);
+
+  CreateContextRequest request;
+  request.mutable_server_def()->set_job_name("localhost");
+  request.mutable_server_def()->set_task_index(0);
+  request.set_rendezvous_id(random::New64());
   CreateContextResponse response;
 
   TF_ASSERT_OK(eager_service_impl.CreateContext(&request, &response));
