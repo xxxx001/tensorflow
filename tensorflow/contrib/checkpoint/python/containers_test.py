@@ -26,8 +26,9 @@ from tensorflow.python.keras import layers
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.platform import test
-from tensorflow.python.training.checkpointable import base as checkpointable
-from tensorflow.python.training.checkpointable import util as checkpointable_utils
+from tensorflow.python.training.tracking import data_structures
+from tensorflow.python.training.tracking import tracking
+from tensorflow.python.training.tracking import util
 
 
 class UniqueNameTrackerTests(test.TestCase):
@@ -48,11 +49,11 @@ class UniqueNameTrackerTests(test.TestCase):
     slots.track(y, "y")
     self.evaluate((x1.initializer, x2.initializer, x3.initializer,
                    y.initializer))
-    save_root = checkpointable_utils.Checkpoint(slots=slots)
+    save_root = util.Checkpoint(slots=slots)
     save_path = save_root.save(checkpoint_prefix)
 
-    restore_slots = checkpointable.Checkpointable()
-    restore_root = checkpointable_utils.Checkpoint(
+    restore_slots = tracking.AutoTrackable()
+    restore_root = util.Checkpoint(
         slots=restore_slots)
     status = restore_root.restore(save_path)
     restore_slots.x = resource_variable_ops.ResourceVariable(0.)
@@ -67,7 +68,7 @@ class UniqueNameTrackerTests(test.TestCase):
 
   @test_util.run_in_graph_and_eager_modes
   def testExample(self):
-    class SlotManager(checkpointable.Checkpointable):
+    class SlotManager(tracking.AutoTrackable):
 
       def __init__(self):
         self.slotdeps = containers.UniqueNameTracker()
@@ -79,15 +80,15 @@ class UniqueNameTrackerTests(test.TestCase):
             resource_variable_ops.ResourceVariable(4.), "y"))
         slots.append(slotdeps.track(
             resource_variable_ops.ResourceVariable(5.), "x"))
-        self.slots = slots
+        self.slots = data_structures.NoDependency(slots)
 
     manager = SlotManager()
     self.evaluate([v.initializer for v in manager.slots])
-    checkpoint = checkpointable_utils.Checkpoint(slot_manager=manager)
+    checkpoint = util.Checkpoint(slot_manager=manager)
     checkpoint_directory = self.get_temp_dir()
     checkpoint_prefix = os.path.join(checkpoint_directory, "ckpt")
     save_path = checkpoint.save(checkpoint_prefix)
-    metadata = checkpointable_utils.object_metadata(save_path)
+    metadata = util.object_metadata(save_path)
     dependency_names = []
     for node in metadata.nodes:
       for child in node.children:

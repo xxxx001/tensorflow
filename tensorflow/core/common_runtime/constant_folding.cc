@@ -37,6 +37,8 @@ limitations under the License.
 #include "tensorflow/core/lib/gtl/cleanup.h"
 #include "tensorflow/core/lib/gtl/flatset.h"
 #include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/platform/denormal.h"
+#include "tensorflow/core/platform/setround.h"
 #include "tensorflow/core/public/session_options.h"
 
 namespace tensorflow {
@@ -47,8 +49,7 @@ namespace {
 // inputs' shapes are known.
 bool IsShapeOp(const Node* n) {
   const auto& ts = n->type_string();
-  return ts == "Shape" || ts == "ShapeN" || ts == "Rank" || ts == "Size" ||
-         ts == "ZerosLike" || ts == "OnesLike";
+  return ts == "Shape" || ts == "ShapeN" || ts == "Rank" || ts == "Size";
 }
 
 // Reads the partially-known shape of each of n's inputs from shape_map, and
@@ -60,6 +61,7 @@ bool ReadPartialShapesFromShapeMap(
         shape_map,
     std::vector<PartialTensorShape>* input_shapes) {
   CHECK(shape_map != nullptr);
+  input_shapes->resize(n->num_inputs());
   for (const Edge* in : n->in_edges()) {
     // Don't need to check if incoming control edges have known shapes.
     if (in->IsControlEdge()) continue;
@@ -70,7 +72,9 @@ bool ReadPartialShapesFromShapeMap(
     }
     const auto& known_shape = known_shape_iter->second;
     CHECK_GT(known_shape.size(), in->src_output()) << known_shape_iter->first;
-    input_shapes->push_back(known_shape[in->src_output()]);
+    DCHECK_GE(in->dst_input(), 0);
+    DCHECK_LT(in->dst_input(), input_shapes->size());
+    (*input_shapes)[in->dst_input()] = known_shape[in->src_output()];
   }
   return true;
 }
@@ -162,63 +166,6 @@ bool MaybeReplaceSizeOp(const Node* n,
   return true;
 }
 
-template <class T>
-void SetAll(Tensor* t, T val) {
-  auto flat_t = t->flat<T>();
-  for (int i = 0; i < flat_t.size(); i++) {
-    flat_t(i) = val;
-  }
-}
-
-#define REPLACE_ZEROS_OR_ONES_CASE(DTYPE)                                      \
-  case DTYPE:                                                                  \
-    SetAll<EnumToDataType<DTYPE>::Type>(&t,                                    \
-                                        EnumToDataType<DTYPE>::Type(int_val)); \
-    break;
-
-bool MaybeReplaceZerosOrOnesLikeOp(
-    const Node* n, const std::vector<PartialTensorShape>& input_shapes,
-    std::unordered_map<const Node*, std::vector<Tensor>>*
-        shape_replacement_map) {
-  std::vector<Tensor> defined_shape;
-  for (const auto& shape : input_shapes) {
-    if (!shape.IsFullyDefined()) {
-      return false;
-    }
-    const DataType op_type = n->output_type(0);
-    TensorShape fully_defined_shape;
-    shape.AsTensorShape(&fully_defined_shape);
-    Tensor t(op_type, fully_defined_shape);
-
-    int int_val = n->type_string() == "OnesLike" ? 1 : 0;
-    switch (op_type) {
-      REPLACE_ZEROS_OR_ONES_CASE(DT_BOOL);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_HALF);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_BFLOAT16);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_FLOAT);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_DOUBLE);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_COMPLEX64);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_COMPLEX128);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_UINT8);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_INT8);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_UINT16);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_INT16);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_INT32);
-      REPLACE_ZEROS_OR_ONES_CASE(DT_INT64);
-      default:
-        VLOG(1) << "Unsupported type " << DataTypeString(op_type);
-        return false;
-    }
-    defined_shape.push_back(t);
-  }
-  // All the inputs had known shapes so we can replace the node by constants
-  // later in the rewrite.
-  shape_replacement_map->insert({n, defined_shape});
-  return true;
-}
-
-#undef REPLACE_ZEROS_OR_ONES_CASE
-
 // If n is a shape Op (Shape, ShapeN, Rank, or Size) and its inputs have their
 // shapes specified in shape_map, then adds to shape_replacement_map a mapping
 // from n to a vector of Tensors, where Tensor k is the (statically known) value
@@ -249,14 +196,9 @@ bool MaybeReplaceShapeOp(
     if (!MaybeReplaceRankOp(n, input_shapes, shape_replacement_map)) {
       return false;
     }
-  } else if (ts == "Size") {
-    if (!MaybeReplaceSizeOp(n, input_shapes, shape_replacement_map)) {
-      return false;
-    }
   } else {
-    CHECK(ts == "ZerosLike" || ts == "OnesLike");
-    if (!MaybeReplaceZerosOrOnesLikeOp(n, input_shapes,
-                                       shape_replacement_map)) {
+    CHECK_EQ(ts, "Size");
+    if (!MaybeReplaceSizeOp(n, input_shapes, shape_replacement_map)) {
       return false;
     }
   }
@@ -303,17 +245,17 @@ bool IsConstantFoldable(
   if (n->IsSink()) {
     return false;
   }
+  if (n->IsFakeParam()) {
+    return false;
+  }
   // Since constant-folding runs on the CPU, do not attempt to constant-fold
   // operators that have no CPU kernel. Also implies that we will not
   // constant-fold functions.
   // TODO(phawkins): allow constant-folding for functions; functions may
   // be arbitrarily expensive to execute.
-  if (!FindKernelDef(DeviceType(DEVICE_CPU), n->def(), /*def=*/nullptr,
-                     /*kernel_class_name=*/nullptr)
-           .ok()) {
+  if (!KernelDefAvailable(DeviceType(DEVICE_CPU), n->def())) {
     return false;
   }
-
   return true;
 }
 
@@ -385,14 +327,15 @@ void FindConstantFoldableNodes(
         shape_replacement_map) {
   bool internal_node_inserted = false;
   // Walk the nodes in data flow order.
-  ReverseDFS(*graph, nullptr,
-             [nodes, constant_control_deps, shape_replacement_map,
-              &internal_node_inserted, &opts](Node* n) {
-               ConsiderConstantFoldableNode(
-                   n, opts, nodes, constant_control_deps, shape_replacement_map,
-                   &internal_node_inserted);
-             },
-             NodeComparatorName());
+  ReverseDFS(
+      *graph, nullptr,
+      [nodes, constant_control_deps, shape_replacement_map,
+       &internal_node_inserted, &opts](Node* n) {
+        ConsiderConstantFoldableNode(n, opts, nodes, constant_control_deps,
+                                     shape_replacement_map,
+                                     &internal_node_inserted);
+      },
+      NodeComparatorName());
   // If we have inserted just leaf level nodes, then there is nothing to fold.
   if (!internal_node_inserted) {
     nodes->clear();
@@ -522,25 +465,25 @@ Graph* GetConstantGraph(
 // 'control_deps' is the set of nodes that should be control predecessors of the
 // new constant node.
 bool ReplaceTensorWithConstant(
-    Graph* graph, Device* partition_device, NodeAndOutput tensor,
+    Graph* graph, const Device* partition_device, NodeAndOutput tensor,
     const Tensor& constant, const gtl::FlatSet<Node*>& control_deps,
     int64 max_constant_size_in_bytes,
     const ConstantFoldNameGenerator& generate_new_name) {
   // Be conservative when replacing a tensor with a constant, when not
   // running on CPU.
-  // 1) If the destination tensor is not an int32 tensor, and has HOST_MEMORY
-  // constraint, do not replace it.
-  // 2) If the destination tensor is an int32 tensor, but has DEVICE_MEMORY
-  // constraint, do not replace it.
-  // 3) If the constant op created does not have a kernel implementation
-  // for the device, do not use it.
+  // 1) Do not replace another constant.
+  // 2) If the destination tensor or any other tensor from the same node is not
+  // an int32 tensor, and has HOST_MEMORY constraint, do not replace it.
+  // 3) If the destination tensor or any other tensor from the same node is an
+  // int32 tensor, and has DEVICE_MEMORY constraint, do not replace it.
   // 4) If the size of the constant in bytes is too large (>
   // max_constant_in_bytes), do not replace it. This prevents the size of the
   // Graph from growing too large.
+  // 5) If the constant op created does not have a kernel implementation
+  // for the device, do not use it.
   // TODO(keveman): Consider adding a new constant op that has a kernel
   // implementation for all types, but with HostMemory constraint on it's
   // output.
-  // 5) Do not replace another constant.
   if (tensor.first->IsConstant()) {
     return false;
   }
@@ -548,16 +491,20 @@ bool ReplaceTensorWithConstant(
                                ? DeviceType{partition_device->device_type()}
                                : DEVICE_CPU;
   if (partition_device && device_type != DEVICE_CPU) {
-    MemoryType memory_type;
-    if (!MemoryTypeForOutput(device_type, graph, tensor.first, tensor.second,
-                             &memory_type)
+    MemoryTypeVector input_mvec;
+    MemoryTypeVector output_mvec;
+    if (!MemoryTypesForNode(graph->op_registry(), device_type,
+                            tensor.first->def(), &input_mvec, &output_mvec)
              .ok()) {
       return false;
     }
-    bool is_int32 = tensor.first->output_type(tensor.second) == DT_INT32;
-    if ((memory_type == HOST_MEMORY && !is_int32) ||
-        (memory_type == DEVICE_MEMORY && is_int32)) {
-      return false;
+    for (int i = 0; i < output_mvec.size(); i++) {
+      MemoryType memory_type = output_mvec[i];
+      bool is_int32 = tensor.first->output_type(i) == DT_INT32;
+      if ((memory_type == HOST_MEMORY && !is_int32) ||
+          (memory_type == DEVICE_MEMORY && is_int32)) {
+        return false;
+      }
     }
   }
   if (constant.TotalBytes() > max_constant_size_in_bytes) {
@@ -615,7 +562,13 @@ bool ReplaceTensorWithConstant(
 
 Status ConstantFold(const ConstantFoldingOptions& opts,
                     FunctionLibraryRuntime* function_library, Env* env,
-                    Device* partition_device, Graph* graph, bool* was_mutated) {
+                    const Device* partition_device, Graph* graph,
+                    bool* was_mutated) {
+  // TensorFlow flushes denormals to zero and rounds to nearest, so we do
+  // the same here.
+  port::ScopedFlushDenormal flush;
+  port::ScopedSetRound round(FE_TONEAREST);
+
   DumpGraph("Before", graph);
   ConstantFoldNameGenerator generate_new_name = opts.generate_new_name;
   if (generate_new_name == nullptr) {

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
 ########################################################
 # tf_c_framework library
 ########################################################
@@ -36,16 +37,3 @@ add_dependencies(
   tf_cc_while_loop
   tf_core_lib
   tf_protos_cc)
-
-if(tensorflow_BUILD_PYTHON_BINDINGS)
-  add_library(tf_c_python_api OBJECT
-    "${tensorflow_source_dir}/tensorflow/c/python_api.cc"
-    "${tensorflow_source_dir}/tensorflow/c/python_api.h"
-  )
-  add_dependencies(
-    tf_c_python_api
-    tf_c
-    tf_core_lib
-    tf_core_framework
-    tf_protos_cc)
-endif()

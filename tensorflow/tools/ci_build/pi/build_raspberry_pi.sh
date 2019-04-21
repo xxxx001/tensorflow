@@ -34,6 +34,8 @@ set -e
 #
 # Make sure you have an up to date version of the Bazel build tool installed too.
 
+export TF_ENABLE_XLA=0
+
 yes '' | ./configure
 
 # Fix for curl build problem in 32-bit, see https://stackoverflow.com/questions/35181744/size-of-array-curl-rule-01-is-negative
@@ -65,6 +67,10 @@ OPENBLAS_SRC_PATH=/tmp/openblas_src/
 sudo rm -rf ${OPENBLAS_SRC_PATH}
 git clone https://github.com/xianyi/OpenBLAS ${OPENBLAS_SRC_PATH}
 cd ${OPENBLAS_SRC_PATH}
+# The commit after this introduced Fortran compile issues. In theory they should
+# be solvable using NOFORTRAN=1 on the make command, but my initial tries didn't
+# work, so pinning to the last know good version.
+git checkout 5a6a2bed9aff0ba8a18651d5514d029c8cae336a
 # If this path is changed, you'll also need to update
 # cxx_builtin_include_directory in third_party/toolchains/cpus/arm/CROSSTOOL.tpl
 OPENBLAS_INSTALL_PATH=/tmp/openblas_install/
@@ -83,7 +89,7 @@ if [[ $1 == "PI_ONE" ]]; then
 else
   PI_COPTS='--copt=-march=armv7-a --copt=-mfpu=neon-vfpv4
   --copt=-std=gnu11 --copt=-DS_IREAD=S_IRUSR --copt=-DS_IWRITE=S_IWUSR
-  --copt=-O3
+  --copt=-O3 --copt=-fno-tree-pre
   --copt=-U__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1
   --copt=-U__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2
   --copt=-U__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8'
@@ -101,6 +107,7 @@ bazel build -c opt ${PI_COPTS} \
   --copt=-funsafe-math-optimizations --copt=-ftree-vectorize \
   --copt=-fomit-frame-pointer --cpu=armeabi \
   --crosstool_top=@local_config_arm_compiler//:toolchain \
+  --define tensorflow_mkldnn_contraction_kernel=0 \
   --verbose_failures \
   //tensorflow:libtensorflow.so \
   //tensorflow:libtensorflow_framework.so \
