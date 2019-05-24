@@ -14,8 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/lite/interpreter.h"
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "third_party/eigen3/Eigen/Core"
 #include "tensorflow/lite/core/api/error_reporter.h"
 #include "tensorflow/lite/kernels/internal/compatibility.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
@@ -54,6 +56,9 @@ namespace {
 
 using ::testing::IsEmpty;
 
+// TODO(b/129561206): Reenable this test on fuchsia builds once the needed gtest
+// library is ported.
+#if !GTEST_OS_FUCHSIA
 // Make an interpreter that has no tensors and no nodes
 TEST(BasicInterpreter, ZeroInterpreter) {
   testing::internal::CaptureStderr();
@@ -72,6 +77,7 @@ TEST(BasicInterpreter, ZeroInterpreter) {
   Interpreter interpreter2;
   EXPECT_THAT(testing::internal::GetCapturedStderr(), IsEmpty());
 }
+#endif
 
 // Test various error conditions.
 TEST(BasicInterpreter, InvokeInvalidModel) {
@@ -164,7 +170,7 @@ TEST(BasicInterpreter, CheckAllocate) {
   } cases[] = {
       {kTfLiteFloat32, sizeof(float)}, {kTfLiteInt32, sizeof(int32_t)},
       {kTfLiteUInt8, sizeof(uint8_t)}, {kTfLiteInt64, sizeof(int64_t)},
-      {kTfLiteInt16, sizeof(int16_t)},
+      {kTfLiteInt16, sizeof(int16_t)}, {kTfLiteFloat16, sizeof(TfLiteFloat16)},
   };
 
   for (auto test : cases) {
@@ -237,6 +243,8 @@ TEST(BasicInterpreter, CheckResize) {
   const uint8_t uint8s[] = {3, 4};
   const int64_t int64s[] = {6, -7};
   const int16_t int16s[] = {8, -9};
+  const Eigen::half float16s[] = {Eigen::half_impl::float_to_half_rtne(-3.f),
+                                  Eigen::half_impl::float_to_half_rtne(-4.f)};
 
   struct {
     TfLiteType type;
@@ -248,6 +256,8 @@ TEST(BasicInterpreter, CheckResize) {
       {kTfLiteUInt8, sizeof(uint8_t), reinterpret_cast<const char*>(uint8s)},
       {kTfLiteInt64, sizeof(int64_t), reinterpret_cast<const char*>(int64s)},
       {kTfLiteInt16, sizeof(int16_t), reinterpret_cast<const char*>(int16s)},
+      {kTfLiteFloat16, sizeof(TfLiteFloat16),
+       reinterpret_cast<const char*>(float16s)},
   };
 
   for (auto test : cases) {
@@ -282,10 +292,8 @@ TEST(BasicInterpreter, CheckResize) {
 TEST(BasicInterpreter, CheckAlignment) {
   struct {
     TfLiteType type;
-  } cases[] = {
-      {kTfLiteFloat32}, {kTfLiteInt32}, {kTfLiteUInt8},
-      {kTfLiteInt64},   {kTfLiteInt16},
-  };
+  } cases[] = {{kTfLiteFloat32}, {kTfLiteInt32}, {kTfLiteUInt8},
+               {kTfLiteInt64},   {kTfLiteInt16}, {kTfLiteFloat16}};
 
   for (auto test : cases) {
     Interpreter interpreter;
@@ -314,9 +322,9 @@ TEST(BasicInterpreter, CheckArenaAllocation) {
 
   std::vector<int> sizes{2048, 4096, 1023, 2047, 1021,
                          2047, 1023, 2046, 0,    2048};
-  for (int i = 0; i < sizes.size(); ++i) {
-    interpreter.SetTensorParametersReadWrite(i, kTfLiteUInt8, "", {sizes[i]},
-                                             quant);
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    interpreter.SetTensorParametersReadWrite(static_cast<int>(i), kTfLiteUInt8,
+                                             "", {sizes[i]}, quant);
   }
   interpreter.SetInputs({0, 1});
   interpreter.SetOutputs({9, 4});
@@ -731,6 +739,17 @@ TEST(BasicInterpreter, TestCustomErrorReporter) {
   ASSERT_EQ(reporter.error_messages(),
             "Invoke called on model that is not ready.");
   ASSERT_EQ(reporter.num_calls(), 1);
+}
+
+TEST(BasicInterpreter, TestUseNNAPI) {
+  TestErrorReporter reporter;
+  Interpreter interpreter(&reporter);
+  interpreter.UseNNAPI(true);
+  ASSERT_EQ(interpreter.AllocateTensors(), kTfLiteOk);
+  ASSERT_EQ(interpreter.Invoke(), kTfLiteOk);
+  interpreter.UseNNAPI(false);
+  ASSERT_EQ(reporter.error_messages(),
+            "Attempting to disable NNAPI delegate after it's applied.");
 }
 
 TEST(BasicInterpreter, TestUnsupportedDelegateFunctions) {

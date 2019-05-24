@@ -1,5 +1,6 @@
 # Description:
 #   Contains experimental kernels for datasets and iterators.
+
 package(default_visibility = ["//tensorflow:internal"])
 
 licenses(["notice"])  # Apache 2.0
@@ -10,10 +11,6 @@ load(
     "//tensorflow:tensorflow.bzl",
     "tf_kernel_library",
 )
-load(
-    "//tensorflow/core:platform/default/build_config.bzl",
-    "tf_proto_library",
-)
 
 tf_kernel_library(
     name = "assert_next_dataset_op",
@@ -22,6 +19,21 @@ tf_kernel_library(
         "//tensorflow/core:experimental_dataset_ops_op_lib",
         "//tensorflow/core:framework",
         "//third_party/eigen3",
+    ],
+)
+
+tf_kernel_library(
+    name = "auto_shard_dataset_op",
+    srcs = ["auto_shard_dataset_op.cc"],
+    deps = [
+        "//tensorflow/core:core_cpu_internal",
+        "//tensorflow/core:dataset_ops_op_lib",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core/grappler/optimizers/data:auto_shard",
+        "//tensorflow/core/kernels/data:dataset_utils",
     ],
 )
 
@@ -70,21 +82,6 @@ tf_kernel_library(
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//third_party/eigen3",
-    ],
-)
-
-tf_kernel_library(
-    name = "auto_shard_dataset_op",
-    srcs = ["auto_shard_dataset_op.cc"],
-    deps = [
-        "//tensorflow/core:core_cpu_internal",
-        "//tensorflow/core:dataset_ops_op_lib",
-        "//tensorflow/core:framework",
-        "//tensorflow/core:lib",
-        "//tensorflow/core:lib_internal",
-        "//tensorflow/core:protos_all_cc",
-        "//tensorflow/core/grappler/optimizers/data:auto_shard",
-        "//tensorflow/core/kernels/data:graph_rewrite_dataset",
     ],
 )
 
@@ -251,7 +248,7 @@ tf_kernel_library(
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/grappler/optimizers/data:rebatch",
-        "//tensorflow/core/kernels/data:graph_rewrite_dataset",
+        "//tensorflow/core/kernels/data:dataset_utils",
     ],
 )
 
@@ -320,6 +317,7 @@ tf_kernel_library(
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
+        "@com_google_absl//absl/time",
     ],
 )
 

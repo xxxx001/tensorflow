@@ -33,6 +33,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/lib/env.h"
 #include "tensorflow/stream_executor/lib/error.h"
 #include "tensorflow/stream_executor/lib/stacktrace.h"
+#include "tensorflow/stream_executor/lib/statusor.h"
 #include "tensorflow/stream_executor/lib/threadpool.h"
 #include "tensorflow/stream_executor/platform/port.h"
 #include "tensorflow/stream_executor/rng.h"
@@ -850,6 +851,72 @@ void StreamExecutor::SubmitTrace(TraceCallT trace_call, ArgsT &&... args) {
 
 internal::StreamExecutorInterface *StreamExecutor::implementation() {
   return implementation_->GetUnderlyingExecutor();
+}
+
+StreamExecutorMemoryAllocator::StreamExecutorMemoryAllocator(
+    StreamExecutor *executor)
+    : DeviceMemoryAllocator(executor->platform()) {
+  stream_executors_[executor->device_ordinal()] = executor;
+}
+
+StreamExecutorMemoryAllocator::StreamExecutorMemoryAllocator(
+    const Platform *platform,
+    absl::Span<StreamExecutor *const> stream_executors)
+    : DeviceMemoryAllocator(platform) {
+  int device_ordinal = -1;
+  for (StreamExecutor *executor : stream_executors) {
+    // Stream executor `Init` method which sets the device ordinal
+    // might not be called yet.
+    stream_executors_[++device_ordinal] = executor;
+  }
+}
+
+port::StatusOr<OwningDeviceMemory> StreamExecutorMemoryAllocator::Allocate(
+    int device_ordinal, uint64 size, bool retry_on_failure) {
+  TF_ASSIGN_OR_RETURN(StreamExecutor * executor,
+                      GetStreamExecutor(device_ordinal));
+  DeviceMemoryBase result = executor->AllocateArray<uint8>(size);
+  if (size > 0 && result == nullptr) {
+    return tensorflow::errors::ResourceExhausted(absl::StrFormat(
+        "Failed to allocate request for %s (%uB) on device ordinal %d",
+        tensorflow::strings::HumanReadableNumBytes(size), size,
+        device_ordinal));
+  }
+  VLOG(3) << absl::StreamFormat(
+      "Allocated %s (%uB) on device ordinal %d: %p",
+      tensorflow::strings::HumanReadableNumBytes(size), size, device_ordinal,
+      result.opaque());
+  return OwningDeviceMemory(result, device_ordinal, this);
+}
+
+port::Status StreamExecutorMemoryAllocator::Deallocate(int device_ordinal,
+                                                       DeviceMemoryBase mem) {
+  if (!mem.is_null()) {
+    TF_ASSIGN_OR_RETURN(StreamExecutor * executor,
+                        GetStreamExecutor(device_ordinal));
+    VLOG(3) << absl::StreamFormat("Freeing %p on device ordinal %d",
+                                  mem.opaque(), device_ordinal);
+    executor->Deallocate(&mem);
+  }
+  return port::Status::OK();
+}
+
+port::StatusOr<StreamExecutor *>
+StreamExecutorMemoryAllocator::GetStreamExecutor(int device_ordinal) {
+  if (device_ordinal < 0) {
+    return tensorflow::errors::InvalidArgument(absl::StrFormat(
+        "device ordinal value (%d) must be non-negative", device_ordinal));
+  }
+  if (stream_executors_[device_ordinal] == nullptr) {
+    return tensorflow::errors::NotFound(
+        absl::StrFormat("Device %s:%d present but not supported",
+                        platform()->Name(), device_ordinal));
+  }
+  return stream_executors_[device_ordinal];
+}
+
+bool StreamExecutorMemoryAllocator::AllowsAsynchronousDeallocation() const {
+  return false;
 }
 
 }  // namespace stream_executor
