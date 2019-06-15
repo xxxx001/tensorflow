@@ -12,7 +12,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-
 #ifndef TENSORFLOW_CORE_KERNELS_DATA_MAP_DATASET_OP_H_
 #define TENSORFLOW_CORE_KERNELS_DATA_MAP_DATASET_OP_H_
 
@@ -24,31 +23,19 @@ namespace data {
 
 class MapDatasetOp : public UnaryDatasetOpKernel {
  public:
-  using MapIteratorFunction =
-      std::function<Status(IteratorContext*, InstantiatedCapturedFunction*,
-                           std::vector<Tensor>, std::vector<Tensor>*)>;
+  static constexpr const char* const kDatasetType = "Map";
+  static constexpr const char* const kInputDataset = "input_dataset";
+  static constexpr const char* const kOtherArguments = "other_arguments";
+  static constexpr const char* const kFunc = "f";
+  static constexpr const char* const kTarguments = "Targuments";
+  static constexpr const char* const kOutputTypes = "output_types";
+  static constexpr const char* const kOutputShapes = "output_shapes";
+  static constexpr const char* const kUseInterOpParallelism =
+      "use_inter_op_parallelism";
+  static constexpr const char* const kPreserveCardinality =
+      "preserve_cardinality";
 
-  static constexpr char kDatasetType[] = "Map";
-  static constexpr char kInputDataset[] = "input_dataset";
-  static constexpr char kOtherArguments[] = "other_arguments";
-  static constexpr char kF[] = "f";
-  static constexpr char kTarguments[] = "Targuments";
-  static constexpr char kOutputTypes[] = "output_types";
-  static constexpr char kOutputShapes[] = "output_shapes";
-  static constexpr char kUseInterOpParallelism[] = "use_inter_op_parallelism";
-  static constexpr char kPreserveCardinality[] = "preserve_cardinality";
-
-  explicit MapDatasetOp(OpKernelConstruction* ctx) : UnaryDatasetOpKernel(ctx) {
-    FunctionMetadata::Params params;
-    OP_REQUIRES_OK(ctx, ctx->GetAttr(kUseInterOpParallelism,
-                                     &params.use_inter_op_parallelism));
-    OP_REQUIRES_OK(ctx,
-                   FunctionMetadata::Create(ctx, kF, params, &func_metadata_));
-    OP_REQUIRES_OK(ctx, ctx->GetAttr(kOutputTypes, &output_types_));
-    OP_REQUIRES_OK(ctx, ctx->GetAttr(kOutputShapes, &output_shapes_));
-    OP_REQUIRES_OK(ctx,
-                   ctx->GetAttr(kPreserveCardinality, &preserve_cardinality_));
-  }
+  explicit MapDatasetOp(OpKernelConstruction* ctx);
 
  protected:
   void MakeDataset(OpKernelContext* ctx, DatasetBase* input,

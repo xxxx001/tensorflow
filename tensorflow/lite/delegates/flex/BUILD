@@ -1,14 +1,15 @@
+load("//tensorflow:tensorflow.bzl", "tf_cc_test")
+
 #
 # This is a TF Lite delegate that is powered by TensorFlow's Eager.
 #
-package(default_visibility = [
-    "//tensorflow/compiler/mlir/lite:__subpackages__",
-    "//tensorflow/lite/toco/tflite:__subpackages__",
-])
-
-licenses(["notice"])  # Apache 2.0
-
-load("//tensorflow:tensorflow.bzl", "tf_cc_test")
+package(
+    default_visibility = [
+        "//tensorflow/compiler/mlir/lite:__subpackages__",
+        "//tensorflow/lite/toco/tflite:__subpackages__",
+    ],
+    licenses = ["notice"],  # Apache 2.0
+)
 
 cc_library(
     name = "buffer_map",

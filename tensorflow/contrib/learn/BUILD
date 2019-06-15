@@ -1,18 +1,17 @@
 # Description:
 #   Contains TF Learn (aka Scikit Flow) sub-project with high level tensorflow API.
 
-licenses(["notice"])  # Apache 2.0
+load("//tensorflow:tensorflow.bzl", "py_test", "tf_py_test")
+
+package(
+    default_visibility = [
+        "//engedu/ml/tf_from_scratch:__pkg__",
+        "//tensorflow:internal",
+    ],
+    licenses = ["notice"],  # Apache 2.0
+)
 
 exports_files(["LICENSE"])
-
-load("//tensorflow:tensorflow.bzl", "py_test")
-
-package(default_visibility = [
-    "//engedu/ml/tf_from_scratch:__pkg__",
-    "//tensorflow:internal",
-])
-
-load("//tensorflow:tensorflow.bzl", "py_test", "tf_py_test")
 
 py_library(
     name = "learn",
@@ -603,6 +602,9 @@ py_test(
     srcs = ["python/learn/estimators/svm_test.py"],
     python_version = "PY2",
     srcs_version = "PY2AND3",
+    tags = [
+        "no_oss",  # b/134605801
+    ],
     deps = [
         ":learn",
         "//tensorflow/contrib/layers:layers_py",
