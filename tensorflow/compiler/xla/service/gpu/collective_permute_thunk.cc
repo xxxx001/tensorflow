@@ -15,13 +15,13 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/gpu/collective_permute_thunk.h"
 
+#include <chrono>  // NOLINT (required by TF interfaces)
 #include <map>
 #include <memory>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/memory/memory.h"
-#include "third_party/gpus/cuda/include/cuda_runtime_api.h"
 #include "tensorflow/compiler/xla/refcounting_hash_map.h"
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_instructions.h"
@@ -40,13 +40,38 @@ namespace {
 
 using tensorflow::BlockingCounter;
 
+// This same function appears in nccl_all_reduce_thunk.  I've copy/pasted it
+// here primarily because I want the VLOGs to work.
+template <typename DescFn>
+void WaitAndLogIfStuck(tensorflow::BlockingCounter* counter,
+                       const DescFn& desc_fn) {
+  VLOG(3) << "Begin: " << desc_fn();
+  const std::chrono::milliseconds timeout(5000);
+  bool ok = counter->WaitFor(timeout);
+  if (ok) {
+    VLOG(3) << "Finished: " << desc_fn();
+    return;
+  }
+  LOG(ERROR) << "This thread has been waiting for " << timeout.count()
+             << "ms for and may be stuck: " << desc_fn();
+  counter->Wait();
+  LOG(ERROR) << "Thread is unstuck!  Warning above was a false-positive.  "
+                "Perhaps the timeout is too short: "
+             << desc_fn();
+}
+
 // Key for looking up a Rendezvous object in our global map.
 //
 // Morally, the key is just a RunId.  num_participants is in this struct only
 // because we use that information when constructing the Rendezvous.
 struct RendezvousKey {
   RunId run_id;
-  int64 num_participants;
+  int num_participants;  // int, not int64, to match BlockingCounter's counter.
+
+  string ToString() const {
+    return absl::StrFormat("RendezvousKey{run_id=%s, num_participants=%d}",
+                           run_id.ToString(), num_participants);
+  }
 
   template <typename H>
   friend H AbslHashValue(H h, const RendezvousKey& k) {
@@ -82,11 +107,7 @@ struct ParticipantData {
 // Rendezvous objects can only be used once.
 class Rendezvous {
  public:
-  explicit Rendezvous(int64 num_participants)
-      : num_participants_(num_participants),
-        all_arrived_(num_participants),
-        returned_blocking_counter_(
-            std::make_shared<BlockingCounter>(num_participants)) {}
+  explicit Rendezvous(const RendezvousKey& key) : key_(key) {}
 
   // Runs the collective permute on the given thread.
   //
@@ -98,19 +119,20 @@ class Rendezvous {
       ParticipantData participant);
 
  private:
-  const int64 num_participants_;
-  BlockingCounter all_arrived_;
+  const RendezvousKey key_;
+  BlockingCounter all_arrived_{key_.num_participants};
 
   // BlockingCounter returned by SubmitParticipant.
-  std::shared_ptr<BlockingCounter> returned_blocking_counter_;
+  std::shared_ptr<BlockingCounter> returned_blocking_counter_{
+      std::make_shared<BlockingCounter>(key_.num_participants)};
 
   tensorflow::mutex mu_;
-  bool initialized_ GUARDED_BY(mu_) = false;
+  bool initialized_ TF_GUARDED_BY(mu_) = false;
 
   // We use an std::map so that we can iterate over it below in a guaranteed
   // order.  The order shouldn't actually matter, but why be nondeterministic if
   // we don't have to be?
-  std::map<int64, ParticipantData> participants_ GUARDED_BY(mu_);
+  std::map<int64, ParticipantData> participants_ TF_GUARDED_BY(mu_);
 };
 
 void EnqueueCopy(se::DeviceMemoryBase src, se::Stream* src_stream,
@@ -146,7 +168,7 @@ StatusOr<std::shared_ptr<BlockingCounter>> Rendezvous::SubmitParticipant(
     if (primary) {
       initialized_ = true;
       returned_blocking_counter_ =
-          std::make_shared<BlockingCounter>(num_participants_);
+          std::make_shared<BlockingCounter>(key_.num_participants);
     }
   }
 
@@ -155,7 +177,13 @@ StatusOr<std::shared_ptr<BlockingCounter>> Rendezvous::SubmitParticipant(
   // everyone, then we wouldn't be able to enqueue the copies at the correct
   // point in their streams.
   all_arrived_.DecrementCount();
-  all_arrived_.Wait();
+  WaitAndLogIfStuck(&all_arrived_, [&] {
+    return absl::StrFormat(
+        "participant for replica %d (stream %p, device %d) waiting for all "
+        "other participants to arrive: %s",
+        participant.replica_id, participant.stream,
+        participant.stream->parent()->device_ordinal(), key_.ToString());
+  });
 
   // Schedule the copies between the devices.  This is much easier to reason
   // about if we schedule all of the copies from just one thread.  The copies
@@ -183,10 +211,7 @@ StatusOr<std::shared_ptr<BlockingCounter>> Rendezvous::SubmitParticipant(
 // Rendezvous objects are one-time use, so they're removed from this map once
 // we're through with them.
 RefcountingHashMap<RendezvousKey, Rendezvous>& GlobalRendezvousMap() {
-  static auto& m = *new RefcountingHashMap<RendezvousKey, Rendezvous>(
-      [](const RendezvousKey& key) {
-        return absl::make_unique<Rendezvous>(key.num_participants);
-      });
+  static auto& m = *new RefcountingHashMap<RendezvousKey, Rendezvous>();
   return m;
 }
 
@@ -205,7 +230,11 @@ Status CollectivePermuteThunk::ExecuteOnStream(const ExecuteParams& params) {
   // Rendezvous with the threads for all other devices that are participating in
   // this CollectivePermute.
   RendezvousKey key{params.run_id, params.device_assn->replica_count()};
-  std::shared_ptr<Rendezvous> rendezvous = GlobalRendezvousMap()[key];
+  auto rendezvous_factory = [](const RendezvousKey& key) {
+    return absl::make_unique<Rendezvous>(key);
+  };
+  std::shared_ptr<Rendezvous> rendezvous =
+      GlobalRendezvousMap().GetOrCreateIfAbsent(key, rendezvous_factory);
 
   TF_ASSIGN_OR_RETURN(int64 replica_id,
                       params.device_assn->ReplicaIdForDeviceOrdinal(
@@ -245,7 +274,13 @@ Status CollectivePermuteThunk::ExecuteOnStream(const ExecuteParams& params) {
   // erase() is deceptively complex to implement correctly.
   rendezvous.reset();
   final_sync->DecrementCount();
-  final_sync->Wait();
+  WaitAndLogIfStuck(final_sync.get(), [&] {
+    return absl::StrFormat(
+        "participant for replica %d (stream %p, device ordinal %d) waiting for "
+        "all threads to drop their reference to the rendezvous: %s",
+        participant.replica_id, participant.stream,
+        participant.stream->parent()->device_ordinal(), key.ToString());
+  });
   return Status::OK();
 }
 

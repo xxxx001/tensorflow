@@ -27,6 +27,18 @@ Status BroadcastXlaActivity(XlaAutoClusteringActivity auto_clustering_activity);
 // Broadcast `jit_compilation_activity` to all the registered listeners.
 Status BroadcastXlaActivity(XlaJitCompilationActivity jit_compilation_activity);
 
+// Broadcast `jit_compilation_activity` to all the registered listeners.
+Status BroadcastOptimizationRemark(XlaOptimizationRemark optimization_remark);
+
+// LINT.IfChange
+// Called after TensorFlow realizes possible lost performance. The parameters in
+// this should match all of the values in the XlaOptimizationRemark proto.
+Status BroadcastOptimizationRemark(
+    XlaOptimizationRemark::Warning optimization_warning,
+    string debug_information);
+
+// LINT.ThenChange(//tensorflow/compiler/jit/xla_activity.proto)
+
 // Various components of the system can subclass XlaActivityListener to
 // notifications on auto-clustering and JIT compilation events.
 //
@@ -41,32 +53,21 @@ class XlaActivityListener {
   virtual Status Listen(
       const XlaJitCompilationActivity& jit_compilation_activity) = 0;
 
+  // Called after TensorFlow realizes possible lost performance.
+  virtual Status Listen(const XlaOptimizationRemark& optimization_remark) = 0;
+
+  // Called at program exit in best-effort manner to give listeners a chance to
+  // flush their state.
+  //
+  // Default implementation is a no-op.
+  virtual void Flush();
+
   virtual ~XlaActivityListener();
 };
 
 // Registers an `XlaActivityListener`, which will be invoked on all subsequent
 // `BroadcastXlaActivity` calls.
 void RegisterXlaActivityListener(std::unique_ptr<XlaActivityListener> listener);
-
-using GlobalProcessIdMaker = std::function<std::string()>;
-
-// Installs `global_process_id_maker` as a "global process id" maker.
-//
-// The value returned by the global process ID maker, if one is installed, is
-// stored in the global_process_id field of the Xla*Activity messages before
-// they're fed to the registered activity listeners.  If no ID maker is
-// installed then global_process_id is set to "unknown".
-//
-// `global_process_id_maker` must be thread safe.
-//
-// The global process id maker is used to tag *Activity messages to so that the
-// broadcasting process can be uniquely identified.  Therefore the global
-// process id maker
-//
-//  - Must always return the same value within the same process.
-//  - Cannot be set or changed after we have broadcasted any XLA activity.
-void SetGlobalProcessIdMaker(GlobalProcessIdMaker global_process_id_maker);
-
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_COMPILER_JIT_XLA_ACTIVITY_LISTENER_H_

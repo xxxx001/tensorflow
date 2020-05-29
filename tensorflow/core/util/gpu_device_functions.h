@@ -22,6 +22,8 @@ limitations under the License.
  * Wraps the warp-cooperative intrinsics introduced in CUDA 9 to provide
  * backwards compatibility, see go/volta-porting for details.
  * Provides atomic operations on types that aren't natively supported.
+ * Defines a number of macros and types providing a shared interface
+ * to either CUDA or ROCm APIs, depending on the build.
  */
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
@@ -33,12 +35,62 @@ limitations under the License.
 #if GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuComplex.h"
 #include "third_party/gpus/cuda/include/cuda.h"
+#else
+#include "rocm/include/hip/hip_complex.h"
 #endif
+
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/gpu_cuda_alias.h"
 
-namespace tensorflow {
+#if GOOGLE_CUDA
+using gpuFloatComplex = cuFloatComplex;
+using gpuDoubleComplex = cuDoubleComplex;
+using gpuStream_t = cudaStream_t;
+using gpuEvent_t = cudaEvent_t;
+#define gpuEventRecord cudaEventRecord
+#define gpuEventSynchronize cudaEventSynchronize
+#define gpuEventDestroy cudaEventDestroy
+#define gpuEventCreate cudaEventCreate
+#define gpuEventCreateWithFlags cudaEventCreateWithFlags
+#define gpuEventDisableTiming cudaEventDisableTiming
+#elif TENSORFLOW_USE_ROCM
+using gpuFloatComplex = hipFloatComplex;
+using gpuDoubleComplex = hipDoubleComplex;
+using gpuStream_t = hipStream_t;
+using gpuEvent_t = hipEvent_t;
+using cudaError = int;
+using cudaError_t = int;
+#define cudaSuccess 0
+#define cudaGetLastError hipGetLastError
+#define gpuEventRecord hipEventRecord
+#define gpuEventDestroy hipEventDestroy
+#define gpuEventSynchronize hipEventSynchronize
+#define gpuEventCreate hipEventCreate
+#define gpuEventCreateWithFlags hipEventCreateWithFlags
+#define gpuEventDisableTiming hipEventDisableTiming
+static std::string cudaGetErrorString(int err) { return std::to_string(err); }
+#endif
 
+#define TF_RETURN_IF_CUDA_ERROR(result)                   \
+  do {                                                    \
+    cudaError_t error(result);                            \
+    if (!SE_PREDICT_TRUE(error == cudaSuccess)) {         \
+      return errors::Internal("Cuda call failed with ",   \
+                              cudaGetErrorString(error)); \
+    }                                                     \
+  } while (0)
+
+#define TF_OP_REQUIRES_CUDA_SUCCESS(context, result)                   \
+  do {                                                                 \
+    cudaError_t error(result);                                         \
+    if (!SE_PREDICT_TRUE(error == cudaSuccess)) {                      \
+      context->SetStatus(errors::Internal("Cuda call failed with",     \
+                                          cudaGetErrorString(error))); \
+      return;                                                          \
+    }                                                                  \
+  } while (0)
+
+namespace tensorflow {
 // According to HIP developer guide at
 // https://github.com/ROCm-Developer-Tools/HIP/blob/master/docs/markdown/hip_kernel_language.md#assert
 // assert is not supported by HIP. While we are waiting for assert support in
@@ -498,7 +550,7 @@ CREATE_CUDA_DEVICE_FUNCTION_ALIAS(GpuLdg, CudaLdg);
 // Note: this function does not synchronize, and therefore the memory range is
 // not guaranteed to be zero until the next kernel launch.
 template <typename T>
-__global__ void SetZero(const int count, T* ptr) {
+__global__ void SetZero(const int count, T* __restrict__ ptr) {
   // Check that the grid is one dimensional and index doesn't overflow.
   assert(blockDim.y == 1);
   assert(blockDim.z == 1);
@@ -510,7 +562,7 @@ __global__ void SetZero(const int count, T* ptr) {
 
 // Helper to set all tensor entries to a specific value.
 template <typename T>
-__global__ void SetToValue(const int count, T* ptr, T value) {
+__global__ void SetToValue(const int count, T* __restrict__ ptr, T value) {
   // Check that the grid is one dimensional and index doesn't overflow.
   assert(blockDim.y == 1);
   assert(blockDim.z == 1);
@@ -538,7 +590,7 @@ CREATE_CUDA_DEVICE_FUNCTION_ALIAS(GpuAtomicCasHelper, CudaAtomicCasHelper);
 // correctly).
 template <typename F>
 __device__ float GpuAtomicCasHelper(float* ptr, F accumulate) {
-  return __float_as_int(
+  return __int_as_float(
       GpuAtomicCasHelper(reinterpret_cast<int32*>(ptr), [accumulate](int32 a) {
         return __float_as_int(accumulate(__int_as_float(a)));
       }));
@@ -620,6 +672,12 @@ __device__ detail::ToTypeIfConvertible<U, T> GpuAtomicAdd(T* ptr, U value) {
   return atomicAdd(ptr, value);
 }
 
+__device__ inline int64 GpuAtomicAdd(int64* ptr, int64 value) {
+  // This cast should be safe since module-2 addition should work fine. However,
+  // signed overflow is not handled correctly since it's undefined behavior.
+  return atomicAdd(reinterpret_cast<uint64*>(ptr), static_cast<uint64>(value));
+}
+
 __device__ inline Eigen::half GpuAtomicAdd(Eigen::half* ptr,
                                            Eigen::half value) {
   return detail::GpuAtomicCasHelper(
@@ -673,9 +731,14 @@ __device__ inline double GpuAtomicSub(double* ptr, double value) {
   return GpuAtomicAdd(ptr, -value);
 }
 
+__device__ inline tensorflow::int64 GpuAtomicSub(tensorflow::int64* ptr,
+                                                 tensorflow::int64 value) {
+  return GpuAtomicAdd(ptr, -value);
+}
+
 __device__ inline tensorflow::uint64 GpuAtomicSub(tensorflow::uint64* ptr,
                                                   tensorflow::uint64 value) {
-  return GpuAtomicAdd(ptr, -value);
+  return GpuAtomicAdd(ptr, -static_cast<tensorflow::int64>(value));
 }
 
 __device__ inline Eigen::half GpuAtomicSub(Eigen::half* ptr,
@@ -877,6 +940,28 @@ __device__ inline std::complex<double> operator/(
   return std::complex<double>(result.x, result.y);
 }
 #endif  // GOOGLE_CUDA
+
+namespace functor {
+// ROCm hcc(clang) has severe difficulties dealing with std::complex directly
+// due to a header issue. This template assists in casting std::complex into the
+// corresponding internal ROCm types.
+template <class T>
+struct MapComplexToHipComplex {
+  typedef T TM;
+};
+
+#if TENSORFLOW_USE_ROCM
+template <>
+struct MapComplexToHipComplex<std::complex<float> > {
+  typedef hipFloatComplex TM;
+};
+
+template <>
+struct MapComplexToHipComplex<std::complex<double> > {
+  typedef hipDoubleComplex TM;
+};
+#endif
+};  // namespace functor
 
 }  // namespace tensorflow
 

@@ -30,10 +30,9 @@ from google.protobuf import text_format
 from tensorflow.core.framework import attr_value_pb2
 from tensorflow.core.framework import graph_pb2
 from tensorflow.core.framework import op_def_pb2
-from tensorflow.core.protobuf import graph_debug_info_pb2
 from tensorflow.core.protobuf import meta_graph_pb2
 from tensorflow.core.protobuf import saver_pb2
-from tensorflow.python import pywrap_tensorflow
+from tensorflow.python.client import pywrap_tf_session as c_api
 from tensorflow.python.eager import context
 from tensorflow.python.framework import error_interpolation
 from tensorflow.python.framework import graph_io
@@ -44,7 +43,6 @@ from tensorflow.python.framework import versions
 from tensorflow.python.lib.io import file_io
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import compat
-from tensorflow.python.util import tf_stack
 
 
 # Prefix to be added to unbound input names so they are easily identifiable.
@@ -186,29 +184,17 @@ def stripped_op_list_for_graph(graph_def):
 
   Returns:
     An `OpList` of ops used by the graph.
-
-  Raises:
-    ValueError: If an unregistered op is used.
   """
-  # This is the Python equivalent of StrippedOpListForGraph in C++.
-  # Unfortunately, since the Python op registry can differ from that in C++, we
-  # can't remove the duplication using swig (at least naively).
-  # TODO(irving): Support taking graphs directly.
-
+  # This is similar to StrippedOpListForGraph in C++, but unlike its
+  # C++ counterpart, this version does not require all ops to be registered.
+  # This is done to support Prelu fusion in tfjs.
   used_ops = ops_used_by_graph_def(graph_def)
-
-  # Verify that all used ops are registered.
-  registered_ops = op_def_registry.get_registered_ops()
-  # These internal ops used by functions are not registered, so we need to
-  # whitelist them.  # TODO(irving): Do something better here.
-  op_whitelist = ("_Arg", "_Retval", "_ListToArray", "_ArrayToList")
-  for op in used_ops:
-    if op not in registered_ops and op not in op_whitelist:
-      raise ValueError("Op %s is used by the graph, but is not registered" % op)
-
-  # Build the stripped op list in sorted order
-  return op_def_pb2.OpList(op=[registered_ops[op] for op in sorted(used_ops)
-                               if op in registered_ops])
+  op_defs = []
+  for op in sorted(used_ops):
+    op_def = op_def_registry.get(op)
+    if op_def is not None:
+      op_defs.append(op_def)
+  return op_def_pb2.OpList(op=op_defs)
 
 
 def _get_kind_name(item):
@@ -311,9 +297,10 @@ def _find_extraneous_saver_nodes(graph_def, saver_def):
   # but it seems unnecessarily complex given the name scope solution.
 
   # load the graph DAG in minimal form, without initializing a full Graph object
-  nodes = {node_def.name:
-           (set([_op_name(x) for x in node_def.input]), node_def.op)
-           for node_def in graph_def.node}
+  nodes = {
+      node_def.name: (set(_op_name(x) for x in node_def.input), node_def.op)
+      for node_def in graph_def.node
+  }
 
   retain_scope_save = None
   retain_scope_restore = None
@@ -327,12 +314,12 @@ def _find_extraneous_saver_nodes(graph_def, saver_def):
     retain_scope_restore = _get_scope(restore_op_name) + "/"
     retain_scope_save = _get_scope(save_op_name) + "/"
 
-  all_saver_node_names = set([name for name, (_, op) in nodes.items()
-                              if op in SAVE_AND_RESTORE_OPS])
+  all_saver_node_names = set(
+      name for name, (_, op) in nodes.items() if op in SAVE_AND_RESTORE_OPS)
 
-  all_saver_scopes = (set([_get_scope(x) for x in all_saver_node_names])
-                      - all_saver_node_names)
-  all_saver_scopes = set([x + "/" for x in all_saver_scopes])
+  all_saver_scopes = (
+      set(_get_scope(x) for x in all_saver_node_names) - all_saver_node_names)
+  all_saver_scopes = set(x + "/" for x in all_saver_scopes)
 
   extraneous_scopes = all_saver_scopes - set([retain_scope_save,
                                               retain_scope_restore])
@@ -459,9 +446,9 @@ def _is_default_attr_value(op_def, attr_name, attr_value):
     if attr_def.name == attr_name:
       if not attr_def.HasField("default_value"):
         return False
-      # pywrap_tensorflow.EqualAttrValueWrapper returns an empty string
+      # c_api.EqualAttrValueWrapper returns an empty string
       # if both arguments represent an equivalent AttrValue instance.
-      return not pywrap_tensorflow.EqualAttrValueWrapper(
+      return not c_api.EqualAttrValueWrapper(
           attr_value.SerializeToString(),
           attr_def.default_value.SerializeToString())
   return False
@@ -484,14 +471,14 @@ def strip_graph_default_valued_attrs(meta_graph_def):
   for function_def in meta_graph_def.graph_def.library.function:
     op_name_to_function[function_def.signature.name] = function_def
 
-  # Get all registered ops.
-  registered_ops = op_def_registry.get_registered_ops()
-
   def _strip_node_default_valued_attrs(node_def):
     """Removes default valued attributes from a single node def."""
-    if node_def.op in op_name_to_function or node_def.op not in registered_ops:
+    if node_def.op in op_name_to_function:
       return
-    op_def = registered_ops[node_def.op]
+
+    op_def = op_def_registry.get(node_def.op)
+    if op_def is None:
+      return
 
     attrs_to_strip = set()
     for attr_name, attr_value in node_def.attr.items():
@@ -512,55 +499,6 @@ def strip_graph_default_valued_attrs(meta_graph_def):
 
   # Tell consumers of this graph that default valued attrs have been stripped.
   meta_graph_def.meta_info_def.stripped_default_attrs = True
-
-
-def create_graph_debug_info_def(operations):
-  """Construct and returns a `GraphDebugInfo` protocol buffer.
-
-  Args:
-    operations: An iterable of op.Operation objects having _traceback members.
-
-  Returns:
-    GraphDebugInfo protocol buffer.
-
-  Raises:
-    TypeError: If the arguments are not of the correct proto buffer type.
-  """
-  # Creates an empty GraphDebugInfoDef proto.
-  graph_debug_info_def = graph_debug_info_pb2.GraphDebugInfo()
-
-  # Gets the file names and line numbers for the exported node names. Also
-  # collects the unique file names.
-  all_file_names = set()
-  node_to_trace = {}
-  for op in operations:
-    # Gets the stack trace of the operation and then the file location.
-    node_name = op.name
-    node_to_trace[node_name] = error_interpolation.compute_useful_frames(op, 10)
-    for frame in node_to_trace[node_name]:
-      all_file_names.add(frame[tf_stack.TB_FILENAME])
-
-  # Sets the `files` field in the GraphDebugInfo proto
-  graph_debug_info_def.files.extend(all_file_names)
-
-  # Builds a mapping between file names and index of the `files` field, so we
-  # only store the indexes for the nodes in the GraphDebugInfo.
-  file_to_index = dict(
-      [(y, x) for x, y in enumerate(graph_debug_info_def.files)])
-
-  # Creates the FileLineCol proto for each node and sets the value in the
-  # GraphDebugInfo proto. We only store the file name index for each node to
-  # save the storage space.
-  for node_name, frames in node_to_trace.items():
-    trace_def = graph_debug_info_def.traces[node_name]
-    for frame in reversed(frames):
-      trace_def.file_line_cols.add(
-          file_index=file_to_index[frame[tf_stack.TB_FILENAME]],
-          line=frame[tf_stack.TB_LINENO],
-          func=frame[tf_stack.TB_FUNCNAME],
-          code=frame[tf_stack.TB_CODEDICT])
-
-  return graph_debug_info_def
 
 
 def create_meta_graph_def(meta_info_def=None,
@@ -829,9 +767,10 @@ def import_scoped_meta_graph_with_return_elements(
             sorted([compat.as_str(v) for v in field.value]) !=
             sorted(input_map)):
           raise ValueError("Graph contains unbound inputs: %s. Must "
-                           "provide these inputs through input_map." %
-                           ",".join([compat.as_str(v) for v in field.value
-                                     if not input_map or v not in input_map]))
+                           "provide these inputs through input_map." % ",".join(
+                               compat.as_str(v)
+                               for v in field.value
+                               if not input_map or v not in input_map))
         break
 
   # Sets graph to default graph if it's not passed in.
@@ -1106,14 +1045,16 @@ def export_scoped_meta_graph(filename=None,
       name, _ = os.path.splitext(filename)
       debug_filename = "{name}{ext}".format(name=name, ext=".debug")
 
-      # Gets the operation from the graph by the name. Exludes variable nodes,
+      # Gets the operation from the graph by the name. Excludes variable nodes,
       # so only the nodes in the frozen models are included.
+      # TODO(liufengdb): fix this for functions.
       ops_to_export = []
       for node in scoped_meta_graph_def.graph_def.node:
         scoped_op_name = ops.prepend_name_scope(node.name, export_scope)
-        ops_to_export.append(graph.get_operation_by_name(scoped_op_name))
+        ops_to_export.append(("", graph.get_operation_by_name(scoped_op_name)))
 
-      graph_debug_info = create_graph_debug_info_def(ops_to_export)
+      graph_debug_info = error_interpolation.create_graph_debug_info_def(
+          ops_to_export)
 
       graph_io.write_graph(
           graph_debug_info,

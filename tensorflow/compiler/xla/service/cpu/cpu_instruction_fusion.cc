@@ -14,6 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/compiler/xla/service/cpu/cpu_instruction_fusion.h"
+
+#include "tensorflow/compiler/xla/service/fusion_node_indexing_evaluation.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/fused_ir_emitter.h"
 
@@ -33,16 +35,18 @@ bool CanBeLoopFused(const HloInstruction& hlo) {
          hlo.opcode() == HloOpcode::kDynamicUpdateSlice ||
          hlo.opcode() == HloOpcode::kGather ||
          hlo.opcode() == HloOpcode::kIota || hlo.opcode() == HloOpcode::kPad ||
+         hlo.opcode() == HloOpcode::kReduce ||
          hlo.opcode() == HloOpcode::kReshape ||
          hlo.opcode() == HloOpcode::kReverse ||
          hlo.opcode() == HloOpcode::kSlice ||
          hlo.opcode() == HloOpcode::kTranspose;
 }
 
-bool IsNonComplexMatrixVectorDot(const HloInstruction* hlo) {
+bool IsNonComplexNonBatchedMatrixVectorDot(const HloInstruction* hlo) {
   const Shape& hlo_shape = hlo->shape();
   return !ShapeUtil::ElementIsComplex(hlo_shape) &&
-         hlo->opcode() == HloOpcode::kDot && hlo_shape.dimensions_size() <= 1;
+         hlo->opcode() == HloOpcode::kDot && hlo_shape.dimensions_size() <= 1 &&
+         hlo->dot_dimension_numbers().lhs_batch_dimensions_size() == 0;
 }
 
 bool HasExactlyOneUse(const HloInstruction& hlo_instr) {
@@ -53,7 +57,7 @@ bool HasExactlyOneUse(const HloInstruction& hlo_instr) {
 bool CanBeOutputFused(const HloInstruction* producer,
                       const HloInstruction* consumer) {
   return consumer->opcode() == HloOpcode::kAdd &&
-         IsNonComplexMatrixVectorDot(producer) &&
+         IsNonComplexNonBatchedMatrixVectorDot(producer) &&
          HasExactlyOneUse(*producer) == 1;
 }
 
@@ -73,10 +77,13 @@ bool CpuInstructionFusion::ShouldFuse(HloInstruction* consumer,
   constexpr int kFusionThresholdBytes = 16 * 1024;
 
   if (CanBeOutputFused(producer, consumer)) {
+    VLOG(2) << "Fusion OK: Can create output fusion.";
     return true;
   }
 
   if (CanBeOutputFusedIntoSomeOperand(producer)) {
+    VLOG(2)
+        << "Bailing because producer can be output-fused into some operand.";
     return false;
   }
 
@@ -117,8 +124,19 @@ bool CpuInstructionFusion::ShouldFuse(HloInstruction* consumer,
   // inefficiencies in the fusion emitter.
   // TODO(b/119692968): Remove this once the fusion emitter can handle
   // arbitrary fusion nodes.
-  if (FusedIrEmitter::IsFusedIrEmitterInefficient(consumer, producer)) {
-    return false;
+  if (consumer->opcode() == HloOpcode::kFusion) {
+    if (fusion_node_evaluations_.find(consumer) ==
+        fusion_node_evaluations_.end()) {
+      // We have no cached results for this fusion node yet. This can happen
+      // when we run the InstructionFusion pass more than once. We can only
+      // cache the results within one run.
+      fusion_node_evaluations_.emplace(consumer,
+                                       FusionNodeIndexingEvaluation(consumer));
+    }
+    if (fusion_node_evaluations_.at(consumer).AverageCodeDuplicationTooHigh(
+            producer)) {
+      return false;
+    }
   }
 
   if (consumer->opcode() == HloOpcode::kDot) {
@@ -151,6 +169,19 @@ bool CpuInstructionFusion::ShouldFuse(HloInstruction* consumer,
     }
   }
 
+  // Don't fuse reductions over the major dimensions. These have an efficient
+  // lowering that's only implemented for the unfused case.
+  if (consumer->opcode() == HloOpcode::kReduce) {
+    return absl::c_linear_search(
+        consumer->dimensions(),
+        LayoutUtil::Minor(consumer->operand(0)->shape().layout(), 0));
+  }
+  if (producer->opcode() == HloOpcode::kReduce) {
+    return absl::c_linear_search(
+        producer->dimensions(),
+        LayoutUtil::Minor(producer->operand(0)->shape().layout(), 0));
+  }
+
   if (consumer->IsLoopFusion()) {
     VLOG(2) << "Fusing: consumer is a fusion node.";
     return true;
@@ -170,6 +201,22 @@ HloInstruction::FusionKind CpuInstructionFusion::ChooseKind(
   return CanBeOutputFused(producer, consumer)
              ? HloInstruction::FusionKind::kOutput
              : HloInstruction::FusionKind::kLoop;
+}
+
+HloInstruction* CpuInstructionFusion::FuseInstruction(
+    HloInstruction* fusion_instruction, HloInstruction* producer) {
+  auto evaluation = fusion_node_evaluations_.find(fusion_instruction);
+  if (evaluation == fusion_node_evaluations_.end()) {
+    evaluation = fusion_node_evaluations_
+                     .emplace(fusion_instruction,
+                              FusionNodeIndexingEvaluation(fusion_instruction))
+                     .first;
+  }
+  auto indexing_users = evaluation->second.RemoveFusionOperand(producer);
+  HloInstruction* new_producer =
+      InstructionFusion::FuseInstruction(fusion_instruction, producer);
+  evaluation->second.UpdateEvaluationCache(new_producer, indexing_users);
+  return new_producer;
 }
 }  // namespace cpu
 }  // namespace xla

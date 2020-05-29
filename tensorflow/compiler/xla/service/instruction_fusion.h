@@ -17,6 +17,9 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_XLA_SERVICE_INSTRUCTION_FUSION_H_
 #define TENSORFLOW_COMPILER_XLA_SERVICE_INSTRUCTION_FUSION_H_
 
+#include <functional>
+#include <utility>
+
 #include "tensorflow/compiler/xla/service/fusion_queue.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
@@ -36,10 +39,12 @@ class InstructionFusion : public HloModulePass {
  public:
   explicit InstructionFusion(
       std::function<bool(const HloInstruction& instruction)> is_expensive,
-      bool may_duplicate = true, bool main_fusion = false)
+      bool may_duplicate = true,
+      FusionConfigCollection config_collection_mode =
+          FusionConfigCollection::kOff)
       : is_expensive_(is_expensive),
         may_duplicate_(may_duplicate),
-        is_main_fusion_(main_fusion) {}
+        config_collection_mode_(config_collection_mode) {}
   ~InstructionFusion() override = default;
   absl::string_view name() const override { return "fusion"; }
 
@@ -85,7 +90,13 @@ class InstructionFusion : public HloModulePass {
   virtual HloInstruction::FusionKind ChooseKind(const HloInstruction* producer,
                                                 const HloInstruction* consumer);
 
-  // Fuses producer into consumer.
+  // Fuses 'producer' into 'fusion_instruction'. 'fusion_instruction' needs to
+  // be a fusion instruction. Returns the newly created clone of 'producer'
+  // which is part of the fusion computation.
+  virtual HloInstruction* FuseInstruction(HloInstruction* fusion_instruction,
+                                          HloInstruction* producer);
+
+  // Fuses producer into consumer. Returns the fusion instruction.
   virtual HloInstruction* Fuse(HloInstruction* producer,
                                HloInstruction* consumer);
 
@@ -123,7 +134,9 @@ class InstructionFusion : public HloModulePass {
   // Reachability information for the current computation.
   std::unique_ptr<HloReachabilityMap> reachability_;
 
-  bool is_main_fusion() { return is_main_fusion_; }
+  FusionConfigCollection config_collection_mode() {
+    return config_collection_mode_;
+  }
 
  private:
   // The set of producers whose consumers we cannot fuse into.
@@ -156,8 +169,8 @@ class InstructionFusion : public HloModulePass {
   // Returns whether we may duplicate an instruction if we want to fuse it.
   bool may_duplicate_;
 
-  // Main fusion pass.
-  bool is_main_fusion_;
+  // Configuration mode.
+  FusionConfigCollection config_collection_mode_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(InstructionFusion);
 };

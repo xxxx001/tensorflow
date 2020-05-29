@@ -17,11 +17,14 @@ limitations under the License.
 
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tensorflow/cc/ops/const_op.h"
 #include "tensorflow/cc/ops/math_ops_internal.h"
+#include "tensorflow/cc/ops/nn_ops.h"
 #include "tensorflow/cc/ops/nn_ops_internal.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor_shape.pb.h"
 #include "tensorflow/core/framework/tensor_testutil.h"
+#include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/grappler/clusters/cluster.h"
 #include "tensorflow/core/grappler/clusters/single_machine.h"
 #include "tensorflow/core/grappler/clusters/virtual_cluster.h"
@@ -43,12 +46,19 @@ constexpr int kWidth = 10;
 constexpr int kHeight = 10;
 constexpr int kDepthIn = 8;
 constexpr int kKernel = 2;
-constexpr int kStride = 2;
+constexpr int kStride1 = 2;
+constexpr int kStride2 = 4;
 constexpr int kOutWidth = 5;
 constexpr int kOutHeight = 5;
 constexpr int kDepthOut = 16;
+constexpr int kDilation = 2;
+constexpr int kPaddingTop = 1;
+constexpr int kPaddingBottom = 2;
+constexpr int kPaddingLeft = 3;
+constexpr int kPaddingRight = 4;
 constexpr char kSrcFormat[] = "NHWC";
 constexpr char kDstFormat[] = "NCHW";
+constexpr char kGPU[] = "GPU";
 constexpr char kAttrOutputShapes[] = "_output_shapes";
 constexpr char kAttrDataFormat[] = "data_format";
 constexpr char kOpTranspose[] = "Transpose";
@@ -91,32 +101,35 @@ void VerifyDataFormatAttributeMatch(const utils::MutableNodeView* node,
   EXPECT_EQ(attr->s(), attr_value);
 }
 
-Output SimpleConv2D(const Scope* scope) {
+Output SimpleConv2D(const Scope* scope, const DataType& data_type = DT_FLOAT) {
   auto input =
       ops::RandomUniform(scope->WithOpName("input"),
-                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, data_type);
   auto filter =
       ops::RandomUniform(scope->WithOpName("filter"),
-                         {kHeight, kWidth, kDepthIn, kDepthOut}, DT_FLOAT);
+                         {kHeight, kWidth, kDepthIn, kDepthOut}, data_type);
   auto conv2d = ops::Conv2D(
       scope->WithOpName("conv2d").WithDevice("/device:GPU:0"), input, filter,
-      {1, 2, 4, 1}, "SAME", ops::Conv2D::DataFormat(kSrcFormat));
+      {1, kStride1, kStride2, 1}, "SAME", ops::Conv2D::DataFormat(kSrcFormat));
 
   return conv2d;
 }
 
-Status CreateSimpleConv2DGraph(GraphDef* graph) {
+Status CreateSimpleConv2DGraph(GraphDef* graph,
+                               const DataType& data_type = DT_FLOAT) {
   Scope scope = Scope::NewRootScope();
-  auto conv2d = SimpleConv2D(&scope);
+  auto conv2d = SimpleConv2D(&scope, data_type);
   auto output = ops::Identity(scope.WithOpName("output"), conv2d);
 
   return scope.ToGraphDef(graph);
 }
 
-Status CreateSimpleFusedBatchNorm(GraphDef* graph) {
+Status CreateSimpleFusedBatchNorm(GraphDef* graph,
+                                  const DataType& data_type = DT_FLOAT) {
   Scope scope = Scope::NewRootScope();
-  auto x = ops::RandomUniform(
-      scope.WithOpName("x"), {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+  auto x =
+      ops::RandomUniform(scope.WithOpName("x"),
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, data_type);
   auto scale =
       ops::RandomUniform(scope.WithOpName("scale"), {kDepthIn}, DT_FLOAT);
   auto offset =
@@ -124,9 +137,9 @@ Status CreateSimpleFusedBatchNorm(GraphDef* graph) {
   auto mean =
       ops::RandomUniform(scope.WithOpName("mean"), {kDepthIn}, DT_FLOAT);
   auto var = ops::RandomUniform(scope.WithOpName("var"), {kDepthIn}, DT_FLOAT);
-  auto batch_norm = ops::FusedBatchNorm(
+  auto batch_norm = ops::FusedBatchNormV2(
       scope.WithOpName("bn").WithDevice("/device:GPU:0"), x, scale, offset,
-      mean, var, ops::FusedBatchNorm::IsTraining(false).Epsilon(0.1f));
+      mean, var, ops::FusedBatchNormV2::IsTraining(false).Epsilon(0.1f));
 
   auto output_y = ops::Identity(scope.WithOpName("output_y"), batch_norm.y);
   auto output_mean =
@@ -137,7 +150,7 @@ Status CreateSimpleFusedBatchNorm(GraphDef* graph) {
   return scope.ToGraphDef(graph);
 }
 
-Status CreateSimpleMaxPoolGrad(GraphDef* graph) {
+Status CreateSimpleMaxPoolGrad(GraphDef* graph, bool use_grad_grad) {
   Scope scope = Scope::NewRootScope();
   auto input =
       ops::RandomUniform(scope.WithOpName("orig_input"),
@@ -145,13 +158,23 @@ Status CreateSimpleMaxPoolGrad(GraphDef* graph) {
   auto output_data = ops::RandomUniform(
       scope.WithOpName("orig_output"),
       {kBatchSize, kOutHeight, kOutWidth, kDepthIn}, DT_FLOAT);
-  auto output_grad = ops::RandomUniform(
-      scope.WithOpName("grad"), {kBatchSize, kOutHeight, kOutWidth, kDepthIn},
-      DT_FLOAT);
-  auto maxpool_grad = ops::internal::MaxPoolGrad(
-      scope.WithOpName("maxpool_grad").WithDevice("/device:GPU:0"), input,
-      output_data, output_grad, {1, kKernel, kKernel, 1},
-      {1, kStride, kStride, 1}, "VALID");
+  auto output_grad =
+      ops::RandomUniform(scope.WithOpName("grad"),
+                         {kBatchSize, use_grad_grad ? kHeight : kOutHeight,
+                          use_grad_grad ? kWidth : kOutWidth, kDepthIn},
+                         DT_FLOAT);
+  Output maxpool_grad;
+  if (use_grad_grad) {
+    maxpool_grad = ops::MaxPoolGradGrad(
+        scope.WithOpName("maxpool_grad").WithDevice("/device:GPU:0"), input,
+        output_data, output_grad, {1, kKernel, kKernel, 1},
+        {1, kStride1, kStride1, 1}, "VALID");
+  } else {
+    maxpool_grad = ops::internal::MaxPoolGrad(
+        scope.WithOpName("maxpool_grad").WithDevice("/device:GPU:0"), input,
+        output_data, output_grad, {1, kKernel, kKernel, 1},
+        {1, kStride1, kStride1, 1}, "VALID");
+  }
 
   auto output = ops::Identity(scope.WithOpName("output"), maxpool_grad);
 
@@ -169,41 +192,83 @@ Status CreateSimpleBiasAddGrad(GraphDef* graph, const Input& shape) {
   return scope.ToGraphDef(graph);
 }
 
-Status CreateSimpleConv2DBackpropFilter(GraphDef* graph) {
+Status CreateSimpleConv2DBackpropFilter(GraphDef* graph,
+                                        const DataType& data_type = DT_FLOAT,
+                                        absl::string_view padding = "SAME") {
   Scope scope = Scope::NewRootScope();
   auto input =
       ops::RandomUniform(scope.WithOpName("input"),
-                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, data_type);
   auto out_backprop =
       ops::RandomUniform(scope.WithOpName("out_backprop"),
-                         {kBatchSize, kHeight, kWidth, kDepthOut}, DT_FLOAT);
-  auto conv2d_backprop_filter = ops::Conv2DBackpropFilter(
-      scope.WithOpName("conv2d_backprop_filter").WithDevice("/device:GPU:0"),
-      input, {kHeight, kWidth, kDepthIn, kDepthOut}, out_backprop, {1, 2, 4, 1},
-      "SAME", ops::Conv2DBackpropFilter::DataFormat(kSrcFormat));
-  auto output =
-      ops::Identity(scope.WithOpName("output"), conv2d_backprop_filter);
+                         {kBatchSize, kHeight, kWidth, kDepthOut}, data_type);
+  if (padding == "EXPLICIT") {
+    auto conv2d_backprop_filter = ops::Conv2DBackpropFilter(
+        scope.WithOpName("conv2d_backprop_filter").WithDevice("/device:GPU:0"),
+        input, {kHeight, kWidth, kDepthIn, kDepthOut}, out_backprop,
+        {1, 2, 4, 1}, padding,
+        ops::Conv2DBackpropFilter::Attrs()
+            .Dilations({1, kDilation, kDilation, 1})
+            .ExplicitPaddings({0, 0, kPaddingTop, kPaddingBottom, kPaddingLeft,
+                               kPaddingRight, 0, 0})
+            .DataFormat(kSrcFormat));
+    auto output =
+        ops::Identity(scope.WithOpName("output"), conv2d_backprop_filter);
+  } else {
+    auto conv2d_backprop_filter = ops::Conv2DBackpropFilter(
+        scope.WithOpName("conv2d_backprop_filter").WithDevice("/device:GPU:0"),
+        input, {kHeight, kWidth, kDepthIn, kDepthOut}, out_backprop,
+        {1, 2, 4, 1}, padding,
+        ops::Conv2DBackpropFilter::DataFormat(kSrcFormat));
+    auto output =
+        ops::Identity(scope.WithOpName("output"), conv2d_backprop_filter);
+  }
 
   return scope.ToGraphDef(graph);
 }
 
-Status CreateSimpleFusedBatchNormGrad(GraphDef* graph, bool is_training) {
+Status CreateSimpleConv2DBackpropInput(GraphDef* graph,
+                                       const DataType& data_type = DT_FLOAT) {
+  Scope scope = Scope::NewRootScope();
+  auto input_sizes = ops::Const(scope.WithOpName("input_sizes"),
+                                {kBatchSize, kHeight, kWidth, kDepthIn});
+  auto input =
+      ops::RandomUniform(scope.WithOpName("input"),
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, data_type);
+  auto filter =
+      ops::RandomUniform(scope.WithOpName("filter"),
+                         {kHeight, kWidth, kDepthIn, kDepthOut}, data_type);
+  auto out_backprop =
+      ops::RandomUniform(scope.WithOpName("out_backprop"),
+                         {kBatchSize, kHeight, kWidth, kDepthOut}, data_type);
+  auto conv2d_backprop_input = ops::Conv2DBackpropInput(
+      scope.WithOpName("conv2d_backprop_input").WithDevice("/device:GPU:0"),
+      input_sizes, filter, out_backprop, {1, kStride1, kStride1, 1}, "VALID");
+  auto output =
+      ops::Identity(scope.WithOpName("output"), conv2d_backprop_input);
+
+  return scope.ToGraphDef(graph);
+}
+
+Status CreateSimpleFusedBatchNormGrad(GraphDef* graph, bool is_training,
+                                      const DataType& data_type = DT_FLOAT) {
   Scope scope = Scope::NewRootScope();
   auto y_backprop =
       ops::RandomUniform(scope.WithOpName("y_backprop"),
-                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
-  auto x = ops::RandomUniform(
-      scope.WithOpName("x"), {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, data_type);
+  auto x =
+      ops::RandomUniform(scope.WithOpName("x"),
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, data_type);
   auto scale =
       ops::RandomUniform(scope.WithOpName("scale"), {kDepthIn}, DT_FLOAT);
   auto reserve_space_1 = ops::RandomUniform(scope.WithOpName("reserve_space_1"),
                                             {kDepthIn}, DT_FLOAT);
   auto reserve_space_2 = ops::RandomUniform(scope.WithOpName("reserve_space_2"),
                                             {kDepthIn}, DT_FLOAT);
-  auto fused_batch_norm_grad = ops::FusedBatchNormGrad(
+  auto fused_batch_norm_grad = ops::FusedBatchNormGradV2(
       scope.WithOpName("fused_batch_norm_grad").WithDevice("/device:GPU:0"),
       y_backprop, x, scale, reserve_space_1, reserve_space_2,
-      ops::FusedBatchNormGrad::DataFormat(kSrcFormat)
+      ops::FusedBatchNormGradV2::DataFormat(kSrcFormat)
           .IsTraining(is_training)
           .Epsilon(0.1f));
   auto x_backprop = ops::Identity(scope.WithOpName("x_backprop"),
@@ -295,7 +360,7 @@ class TransposerTest : public ::testing::Test {
           absl::make_unique<SingleMachine>(/*timeout_s=*/10, 1, 1);
     } else {
       DeviceProperties gpu_device;
-      gpu_device.set_type("GPU");
+      gpu_device.set_type(kGPU);
       gpu_device.mutable_environment()->insert({"architecture", "6"});
       virtual_cluster_ =
           absl::WrapUnique(new VirtualCluster({{"/GPU:1", gpu_device}}));
@@ -309,14 +374,15 @@ class TransposerTest : public ::testing::Test {
 };
 
 TEST_F(TransposerTest, CreateConstPermNode) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DGraph(&item.graph));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   TransposerImpl transposer;
   constexpr char kNodeName[] = "const_perm_node";
@@ -324,7 +390,7 @@ TEST_F(TransposerTest, CreateConstPermNode) {
   utils::MutationNewNode added_node;
   EXPECT_FALSE(context.graph_view->HasNode(kNodeName));
   TF_ASSERT_OK(transposer.CreateConstPermNode(&context, kNodeName, kDevice,
-                                              {0, 3, 1, 2}, &added_node));
+                                              {0, 3, 1, 2}, "", &added_node));
   TF_ASSERT_OK(context.graph_view->GetMutationBuilder()->Apply());
 
   utils::MutableNodeView* const_perm_node =
@@ -352,14 +418,15 @@ TensorShapeProto MakeTensorShapeFromDimensions(absl::Span<const int> dims) {
 }
 
 TEST_F(TransposerTest, CreateTransposeNode) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DGraph(&item.graph));
-  TF_ASSERT_OK(
-      TransposeContext::InitializeTransposeContext(item, nullptr, &context));
+  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+      item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   TransposerImpl transposer;
   constexpr char kNodeNameFormat[] =
@@ -391,21 +458,20 @@ TEST_F(TransposerTest, CreateTransposeNode) {
 }
 
 TEST_F(TransposerTest, UpdateNode) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DGraph(&item.graph));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer transposer;
   auto* conv2d = context.graph_view->GetNode("conv2d");
   ASSERT_NE(conv2d, nullptr);
-  NodeLayoutContext layout;
-  layout.Initialize(kSrcFormat, kDstFormat, /*is_transposable=*/true);
-  TF_ASSERT_OK(transposer.UpdateNode(&context, layout, conv2d));
+  TF_ASSERT_OK(transposer.UpdateNode(&context, conv2d));
   TF_ASSERT_OK(context.graph_view->GetMutationBuilder()->Apply());
 
   auto* updated_conv2d = context.graph_view->GetNode("conv2d");
@@ -423,14 +489,15 @@ AttrValue_ListValue MakeAttrValueListValueFromVector(
 }
 
 TEST_F(TransposerTest, UpdateStrides) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DGraph(&item.graph));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, "ABCD", "ACBD");
 
   AttrValue_ListValue expected_original_strides =
       MakeAttrValueListValueFromVector({1, 2, 4, 1});
@@ -449,9 +516,7 @@ TEST_F(TransposerTest, UpdateStrides) {
   TF_ASSERT_OK(context.graph_view->GetMutationBuilder()->Apply());
 
   DefaultLayoutSensitiveOpTransposer transposer;
-  NodeLayoutContext layout;
-  layout.Initialize("ABCD", "ACBD", /*is_transposable=*/true);
-  TF_ASSERT_OK(transposer.UpdateNode(&context, layout, conv2d));
+  TF_ASSERT_OK(transposer.UpdateNode(&context, conv2d));
   TF_ASSERT_OK(context.graph_view->GetMutationBuilder()->Apply());
 
   auto* updated_conv2d = context.graph_view->GetNode("conv2d");
@@ -462,25 +527,24 @@ TEST_F(TransposerTest, UpdateStrides) {
 }
 
 TEST_F(TransposerTest, UpdateFaninEdgesTranspose) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleFusedBatchNormGrad(&item.graph, true));
-  TF_ASSERT_OK(
-      TransposeContext::InitializeTransposeContext(item, nullptr, &context));
+  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+      item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   FusedBatchNormGradTransposer transposer;
-  NodeLayoutContext layout;
-  layout.Initialize(kSrcFormat, kDstFormat, /*is_transposable=*/true);
   auto* fbng = context.graph_view->GetNode("fused_batch_norm_grad");
   ASSERT_NE(fbng, nullptr);
   const auto& fbng_output_shapes_attr = fbng->GetAttr("_output_shapes");
   ASSERT_NE(fbng_output_shapes_attr, nullptr);
   const TensorShapeProto& expected_shape = fbng_output_shapes_attr->shape();
-  TF_ASSERT_OK(transposer.UpdateFaninEdgesWithOp(&context, layout, {0, 1}, fbng,
-                                                 kOpTranspose));
+  TF_ASSERT_OK(
+      transposer.UpdateFaninEdgesWithOp(&context, {0, 1}, fbng, kOpTranspose));
   TF_ASSERT_OK(context.graph_view->GetMutationBuilder()->Apply());
 
   // Verify output shape matches input shape.
@@ -522,18 +586,17 @@ TEST_F(TransposerTest, UpdateFaninEdgesTranspose) {
 }
 
 TEST_F(TransposerTest, UpdateFanoutEdgesTranspose) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DGraph(&item.graph));
-  TF_ASSERT_OK(
-      TransposeContext::InitializeTransposeContext(item, nullptr, &context));
+  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+      item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   TransposerImpl transposer;
-  NodeLayoutContext layout;
-  layout.Initialize(kSrcFormat, kDstFormat, /*is_transposable=*/true);
   TensorShapeProto expected_original_shape =
       MakeTensorShapeFromDimensions({32, 5, 3, 16});
   TensorShapeProto expected_updated_shape =
@@ -543,8 +606,8 @@ TEST_F(TransposerTest, UpdateFanoutEdgesTranspose) {
   ASSERT_NE(conv2d, nullptr);
   VerifyShapeAttributeMatch(conv2d, 0, expected_original_shape.DebugString());
 
-  TF_ASSERT_OK(transposer.UpdateFanoutEdgesWithOp(&context, layout, {0}, conv2d,
-                                                  kOpTranspose));
+  TF_ASSERT_OK(
+      transposer.UpdateFanoutEdgesWithOp(&context, {0}, conv2d, kOpTranspose));
   TF_ASSERT_OK(context.graph_view->GetMutationBuilder()->Apply());
 
   auto* updated_conv2d = context.graph_view->GetNode("conv2d");
@@ -576,15 +639,16 @@ TEST_F(TransposerTest, UpdateFanoutEdgesTranspose) {
 }
 
 TEST_F(TransposerTest, DefaultLayoutSensitiveOpTransposerTestFusedBatchNorm) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   // Use FusedBatchNorm for default transposer test
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleFusedBatchNorm(&item.graph));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer transposer;
   auto* bn = context.graph_view->GetNode("bn");
@@ -631,15 +695,16 @@ TEST_F(TransposerTest, DefaultLayoutSensitiveOpTransposerTestFusedBatchNorm) {
 }
 
 TEST_F(TransposerTest, DefaultLayoutSensitiveOpTransposerTestConv2D) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   // Use Conv2D for default transposer test
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DGraph(&item.graph));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer transposer;
   auto* conv2d = context.graph_view->GetNode("conv2d");
@@ -660,6 +725,13 @@ TEST_F(TransposerTest, DefaultLayoutSensitiveOpTransposerTestConv2D) {
   VerifyRegularFaninMatch(conv2d_node, 0, input_transpose_node->GetName(), 0);
   VerifyRegularFaninMatch(conv2d_node, 1, "filter", 0);
   VerifyDataFormatAttributeMatch(conv2d_node, kDstFormat);
+  const auto* strides_attr = conv2d_node->GetAttr("strides");
+  ASSERT_NE(strides_attr, nullptr);
+  ASSERT_EQ(strides_attr->list().i_size(), 4);
+  EXPECT_EQ(strides_attr->list().i(0), 1);
+  EXPECT_EQ(strides_attr->list().i(1), 1);
+  EXPECT_EQ(strides_attr->list().i(2), kStride1);
+  EXPECT_EQ(strides_attr->list().i(3), kStride2);
 
   auto* output_transpose_node = context.graph_view->GetNode(
       "conv2d-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
@@ -674,66 +746,70 @@ TEST_F(TransposerTest, DefaultLayoutSensitiveOpTransposerTestConv2D) {
 }
 
 TEST_F(TransposerTest, MaxPoolGradTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
-  GrapplerItem item;
-  TransposeContext context;
-  TF_ASSERT_OK(CreateSimpleMaxPoolGrad(&item.graph));
-  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
-      item, virtual_cluster_.get(), &context));
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  for (bool use_grad_grad : {false, true}) {
+    GrapplerItem item;
+    TransposeContext context;
+    TF_ASSERT_OK(CreateSimpleMaxPoolGrad(&item.graph, use_grad_grad));
+    TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+        item, virtual_cluster_.get(), &context));
+    context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
-  MaxPoolGradTransposer transposer;
-  auto* maxpool_grad = context.graph_view->GetNode("maxpool_grad");
-  ASSERT_NE(maxpool_grad, nullptr);
-  TF_ASSERT_OK(transposer.TransposeNode(&context, maxpool_grad));
+    MaxPoolGradTransposer transposer;
+    auto* maxpool_grad = context.graph_view->GetNode("maxpool_grad");
+    ASSERT_NE(maxpool_grad, nullptr);
+    TF_ASSERT_OK(transposer.TransposeNode(&context, maxpool_grad));
 
-  auto* input_transpose_node1 = context.graph_view->GetNode(
-      "maxpool_grad-0-TransposeNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(input_transpose_node1, nullptr);
-  ASSERT_EQ(input_transpose_node1->NumRegularFanins(), 2);
-  VerifyRegularFaninMatch(input_transpose_node1, 0, "orig_input", 0);
+    auto* input_transpose_node1 = context.graph_view->GetNode(
+        "maxpool_grad-0-TransposeNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(input_transpose_node1, nullptr);
+    ASSERT_EQ(input_transpose_node1->NumRegularFanins(), 2);
+    VerifyRegularFaninMatch(input_transpose_node1, 0, "orig_input", 0);
 
-  auto* input_transpose_node2 = context.graph_view->GetNode(
-      "maxpool_grad-1-TransposeNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(input_transpose_node2, nullptr);
-  ASSERT_EQ(input_transpose_node2->NumRegularFanins(), 2);
-  VerifyRegularFaninMatch(input_transpose_node2, 0, "orig_output", 0);
+    auto* input_transpose_node2 = context.graph_view->GetNode(
+        "maxpool_grad-1-TransposeNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(input_transpose_node2, nullptr);
+    ASSERT_EQ(input_transpose_node2->NumRegularFanins(), 2);
+    VerifyRegularFaninMatch(input_transpose_node2, 0, "orig_output", 0);
 
-  auto* input_transpose_node3 = context.graph_view->GetNode(
-      "maxpool_grad-2-TransposeNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(input_transpose_node3, nullptr);
-  ASSERT_EQ(input_transpose_node3->NumRegularFanins(), 2);
-  VerifyRegularFaninMatch(input_transpose_node3, 0, "grad", 0);
+    auto* input_transpose_node3 = context.graph_view->GetNode(
+        "maxpool_grad-2-TransposeNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(input_transpose_node3, nullptr);
+    ASSERT_EQ(input_transpose_node3->NumRegularFanins(), 2);
+    VerifyRegularFaninMatch(input_transpose_node3, 0, "grad", 0);
 
-  auto* updated_maxpool_grad = context.graph_view->GetNode("maxpool_grad");
-  VerifyDataFormatAttributeMatch(updated_maxpool_grad, kDstFormat);
-  ASSERT_EQ(updated_maxpool_grad->NumRegularFanins(), 3);
-  VerifyRegularFaninMatch(updated_maxpool_grad, 0,
-                          input_transpose_node1->GetName(), 0);
-  VerifyRegularFaninMatch(updated_maxpool_grad, 1,
-                          input_transpose_node2->GetName(), 0);
-  VerifyRegularFaninMatch(updated_maxpool_grad, 2,
-                          input_transpose_node3->GetName(), 0);
+    auto* updated_maxpool_grad = context.graph_view->GetNode("maxpool_grad");
+    VerifyDataFormatAttributeMatch(updated_maxpool_grad, kDstFormat);
+    ASSERT_EQ(updated_maxpool_grad->NumRegularFanins(), 3);
+    VerifyRegularFaninMatch(updated_maxpool_grad, 0,
+                            input_transpose_node1->GetName(), 0);
+    VerifyRegularFaninMatch(updated_maxpool_grad, 1,
+                            input_transpose_node2->GetName(), 0);
+    VerifyRegularFaninMatch(updated_maxpool_grad, 2,
+                            input_transpose_node3->GetName(), 0);
 
-  auto* output_transpose_node = context.graph_view->GetNode(
-      "maxpool_grad-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
-  ASSERT_NE(output_transpose_node, nullptr);
-  ASSERT_EQ(output_transpose_node->NumRegularFanins(), 2);
-  VerifyRegularFaninMatch(output_transpose_node, 0,
-                          updated_maxpool_grad->GetName(), 0);
+    auto* output_transpose_node = context.graph_view->GetNode(
+        "maxpool_grad-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
+    ASSERT_NE(output_transpose_node, nullptr);
+    ASSERT_EQ(output_transpose_node->NumRegularFanins(), 2);
+    VerifyRegularFaninMatch(output_transpose_node, 0,
+                            updated_maxpool_grad->GetName(), 0);
+  }
 }
 
 TEST_F(TransposerTest, BiasAddGradTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleBiasAddGrad(
       &item.graph, {kBatchSize, kHeight, kWidth, kDepthIn}));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   BiasAddGradTransposer transposer;
   auto* bag = context.graph_view->GetNode("bag");
@@ -769,6 +845,7 @@ TEST_F(TransposerTest, BiasAddGradTransposerIncorrectInputTest) {
       CreateSimpleBiasAddGrad(&item.graph, {kHeight, kWidth, kDepthIn}));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   BiasAddGradTransposer transposer;
   auto* bag = context.graph_view->GetNode("bag");
@@ -795,14 +872,15 @@ TEST_F(TransposerTest, BiasAddGradTransposerIncorrectInputTest) {
 }
 
 TEST_F(TransposerTest, Conv2DBackpropFilterTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleConv2DBackpropFilter(&item.graph));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   Conv2DBackpropFilterTransposer transposer;
   auto* conv2d_bf = context.graph_view->GetNode("conv2d_backprop_filter");
@@ -846,15 +924,115 @@ TEST_F(TransposerTest, Conv2DBackpropFilterTransposerTest) {
   VerifyRegularFaninMatch(output_node, 0, conv2d_bf_node->GetName(), 0);
 }
 
+TEST_F(TransposerTest, NodeAttributes) {
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GrapplerItem item;
+  TransposeContext context;
+  TF_ASSERT_OK(
+      CreateSimpleConv2DBackpropFilter(&item.graph, DT_FLOAT, "EXPLICIT"));
+  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+      item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
+
+  Conv2DBackpropFilterTransposer transposer;
+  auto* conv2d_bf = context.graph_view->GetNode("conv2d_backprop_filter");
+  ASSERT_NE(conv2d_bf, nullptr);
+  TF_ASSERT_OK(transposer.TransposeNode(&context, conv2d_bf));
+
+  auto* conv2d_bf_node = context.graph_view->GetNode("conv2d_backprop_filter");
+  ASSERT_NE(conv2d_bf_node, nullptr);
+  ASSERT_EQ(conv2d_bf_node->NumRegularFanins(), 3);
+  VerifyDataFormatAttributeMatch(conv2d_bf_node, kDstFormat);
+  auto* dilations_attr = conv2d_bf_node->GetAttr("dilations");
+  ASSERT_NE(dilations_attr, nullptr);
+  ASSERT_EQ(dilations_attr->list().i_size(), 4);
+  EXPECT_EQ(dilations_attr->list().i(0), 1);
+  EXPECT_EQ(dilations_attr->list().i(1), 1);
+  EXPECT_EQ(dilations_attr->list().i(2), kDilation);
+  EXPECT_EQ(dilations_attr->list().i(3), kDilation);
+  auto* explicit_paddings_attr = conv2d_bf_node->GetAttr("explicit_paddings");
+  ASSERT_NE(explicit_paddings_attr, nullptr);
+  ASSERT_EQ(explicit_paddings_attr->list().i_size(), 8);
+  EXPECT_EQ(explicit_paddings_attr->list().i(0), 0);
+  EXPECT_EQ(explicit_paddings_attr->list().i(1), 0);
+  EXPECT_EQ(explicit_paddings_attr->list().i(2), 0);
+  EXPECT_EQ(explicit_paddings_attr->list().i(3), 0);
+  EXPECT_EQ(explicit_paddings_attr->list().i(4), kPaddingTop);
+  EXPECT_EQ(explicit_paddings_attr->list().i(5), kPaddingBottom);
+  EXPECT_EQ(explicit_paddings_attr->list().i(6), kPaddingLeft);
+  EXPECT_EQ(explicit_paddings_attr->list().i(7), kPaddingRight);
+}
+
+TEST_F(TransposerTest, Conv2DBackpropInputTransposerTest) {
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GrapplerItem item;
+  TransposeContext context;
+  TF_ASSERT_OK(CreateSimpleConv2DBackpropInput(&item.graph));
+  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+      item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
+
+  Conv2DBackpropInputTransposer transposer;
+  auto* conv2d_i = context.graph_view->GetNode("conv2d_backprop_input");
+  ASSERT_NE(conv2d_i, nullptr);
+  TF_ASSERT_OK(transposer.TransposeNode(&context, conv2d_i));
+
+  // The expected optimized graph contains 1 extra set of Transpose nodes,
+  // 1 DataFormatVecPermute node and has the Conv2DBackpropInput's data_format
+  // set to "NCHW".
+  auto* input_vec_permute_node = context.graph_view->GetNode(
+      "conv2d_backprop_input-0-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
+  ASSERT_NE(input_vec_permute_node, nullptr);
+  ASSERT_EQ(input_vec_permute_node->NumRegularFanins(), 1);
+  const auto* src_format_attr = input_vec_permute_node->GetAttr(kAttrSrcFormat);
+  ASSERT_NE(src_format_attr, nullptr);
+  EXPECT_EQ(src_format_attr->s(), kSrcFormat);
+  const auto* dst_format_attr = input_vec_permute_node->GetAttr(kAttrDstFormat);
+  ASSERT_NE(dst_format_attr, nullptr);
+  EXPECT_EQ(dst_format_attr->s(), kDstFormat);
+
+  auto* input_transpose_node = context.graph_view->GetNode(
+      "conv2d_backprop_input-2-TransposeNHWCToNCHW-LayoutOptimizer");
+  ASSERT_NE(input_transpose_node, nullptr);
+  ASSERT_EQ(input_transpose_node->NumRegularFanins(), 2);
+  VerifyRegularFaninMatch(input_transpose_node, 0, "out_backprop", 0);
+
+  auto* conv2d_i_node = context.graph_view->GetNode("conv2d_backprop_input");
+  ASSERT_NE(conv2d_i_node, nullptr);
+  ASSERT_EQ(conv2d_i_node->NumRegularFanins(), 3);
+  VerifyRegularFaninMatch(conv2d_i_node, 0, input_vec_permute_node->GetName(),
+                          0);
+  VerifyRegularFaninMatch(conv2d_i_node, 1, "filter", 0);
+  VerifyRegularFaninMatch(conv2d_i_node, 2, input_transpose_node->GetName(), 0);
+  VerifyDataFormatAttributeMatch(conv2d_i_node, kDstFormat);
+
+  auto* output_transpose_node = context.graph_view->GetNode(
+      "conv2d_backprop_input-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
+  ASSERT_NE(output_transpose_node, nullptr);
+  ASSERT_EQ(output_transpose_node->NumRegularFanins(), 2);
+  VerifyRegularFaninMatch(output_transpose_node, 0, conv2d_i_node->GetName(),
+                          0);
+
+  auto* output_node = context.graph_view->GetNode("output");
+  ASSERT_NE(output_node, nullptr);
+  ASSERT_EQ(output_node->NumRegularFanins(), 1);
+  VerifyRegularFaninMatch(output_node, 0, output_transpose_node->GetName(), 0);
+}
+
 TEST_F(TransposerTest, FusedBatchNormGradTransposerIsTrainingTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TransposeContext context;
   TF_ASSERT_OK(CreateSimpleFusedBatchNormGrad(&item.graph, true));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   FusedBatchNormGradTransposer transposer;
   auto* fbng = context.graph_view->GetNode("fused_batch_norm_grad");
@@ -923,6 +1101,7 @@ TEST_F(TransposerTest, FusedBatchNormGradTransposerNotTrainingTest) {
   TF_ASSERT_OK(CreateSimpleFusedBatchNormGrad(&item.graph, false));
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   FusedBatchNormGradTransposer transposer;
   auto* fbng = context.graph_view->GetNode("fused_batch_norm_grad");
@@ -980,9 +1159,9 @@ TEST_F(TransposerTest, FusedBatchNormGradTransposerNotTrainingTest) {
 }
 
 TEST_F(TransposerTest, DefaultLayoutAgnosticOpTransposerIdentityTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -993,6 +1172,7 @@ TEST_F(TransposerTest, DefaultLayoutAgnosticOpTransposerIdentityTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1030,9 +1210,9 @@ TEST_F(TransposerTest, DefaultLayoutAgnosticOpTransposerIdentityTest) {
 }
 
 TEST_F(TransposerTest, DefaultLayoutAgnosticOpTransposerIdentityBadInputTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1044,6 +1224,7 @@ TEST_F(TransposerTest, DefaultLayoutAgnosticOpTransposerIdentityBadInputTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1077,14 +1258,15 @@ TEST_F(TransposerTest, DefaultLayoutAgnosticOpTransposerIdentityBadInputTest) {
 }
 
 TEST_F(TransposerTest, AddNTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TF_ASSERT_OK(CreateSimpleAddN(&item.graph));
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* conv2d = context.graph_view->GetNode("conv2d");
@@ -1148,6 +1330,7 @@ TEST_F(TransposerTest, AddNTransposerNotAfterTransformTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   AddNTransposer addn_transposer;
   auto* an = context.graph_view->GetNode("add_n");
@@ -1190,14 +1373,15 @@ TEST_F(TransposerTest, AddNTransposerNotAfterTransformTest) {
 }
 
 TEST_F(TransposerTest, IdentityNTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   TF_ASSERT_OK(CreateSimpleIdentityN(&item.graph));
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* conv2d_1 = context.graph_view->GetNode("conv2d_1");
@@ -1282,9 +1466,9 @@ TEST_F(TransposerTest, IdentityNTransposerTest) {
 }
 
 TEST_F(TransposerTest, MergeTransposerTestMergeBothInputsConvertible) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1296,6 +1480,7 @@ TEST_F(TransposerTest, MergeTransposerTestMergeBothInputsConvertible) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1340,9 +1525,9 @@ TEST_F(TransposerTest, MergeTransposerTestMergeBothInputsConvertible) {
 }
 
 TEST_F(TransposerTest, MergeTransposerTestMergeOneInputNotConvertible) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1355,6 +1540,7 @@ TEST_F(TransposerTest, MergeTransposerTestMergeOneInputNotConvertible) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1394,9 +1580,9 @@ TEST_F(TransposerTest, MergeTransposerTestMergeOneInputNotConvertible) {
 }
 
 TEST_F(TransposerTest, PadTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1408,6 +1594,7 @@ TEST_F(TransposerTest, PadTransposerTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1453,9 +1640,9 @@ TEST_F(TransposerTest, PadTransposerTest) {
 }
 
 TEST_F(TransposerTest, SwitchTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1468,6 +1655,7 @@ TEST_F(TransposerTest, SwitchTransposerTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1517,9 +1705,9 @@ TEST_F(TransposerTest, SwitchTransposerTest) {
 }
 
 TEST_F(TransposerTest, TernaryOpTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1534,6 +1722,7 @@ TEST_F(TransposerTest, TernaryOpTransposerTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1586,9 +1775,9 @@ TEST_F(TransposerTest, TernaryOpTransposerTest) {
 }
 
 TEST_F(TransposerTest, UnaryGradTransposerTestTanhGrad) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1601,6 +1790,7 @@ TEST_F(TransposerTest, UnaryGradTransposerTestTanhGrad) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1649,9 +1839,9 @@ TEST_F(TransposerTest, UnaryGradTransposerTestTanhGrad) {
 }
 
 TEST_F(TransposerTest, UnaryGradTransposerTestRelu6Grad) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto conv2d = SimpleConv2D(&scope);
@@ -1664,6 +1854,7 @@ TEST_F(TransposerTest, UnaryGradTransposerTestRelu6Grad) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1712,9 +1903,9 @@ TEST_F(TransposerTest, UnaryGradTransposerTestRelu6Grad) {
 }
 
 TEST_F(TransposerTest, SqueezeTransposerTest) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -1732,6 +1923,7 @@ TEST_F(TransposerTest, SqueezeTransposerTest) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1766,9 +1958,9 @@ TEST_F(TransposerTest, SqueezeTransposerTest) {
 }
 
 TEST_F(TransposerTest, SqueezeTransposerTestUnsupportedInputShape) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -1786,6 +1978,7 @@ TEST_F(TransposerTest, SqueezeTransposerTestUnsupportedInputShape) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1804,9 +1997,9 @@ TEST_F(TransposerTest, SqueezeTransposerTestUnsupportedInputShape) {
 }
 
 TEST_F(TransposerTest, SqueezeTransposerTestInvalidHWAxis) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -1825,6 +2018,7 @@ TEST_F(TransposerTest, SqueezeTransposerTestInvalidHWAxis) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1843,9 +2037,9 @@ TEST_F(TransposerTest, SqueezeTransposerTestInvalidHWAxis) {
 }
 
 TEST_F(TransposerTest, SqueezeTransposerTestInvalidNHWAxis) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -1864,6 +2058,7 @@ TEST_F(TransposerTest, SqueezeTransposerTestInvalidNHWAxis) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1882,9 +2077,9 @@ TEST_F(TransposerTest, SqueezeTransposerTestInvalidNHWAxis) {
 }
 
 TEST_F(TransposerTest, SqueezeTransposerTestSqueezeDimsUpdated) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -1903,6 +2098,7 @@ TEST_F(TransposerTest, SqueezeTransposerTestSqueezeDimsUpdated) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -1942,9 +2138,9 @@ TEST_F(TransposerTest, SqueezeTransposerTestSqueezeDimsUpdated) {
 }
 
 TEST_F(TransposerTest, MaxPoolV2Transposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -1961,6 +2157,7 @@ TEST_F(TransposerTest, MaxPoolV2Transposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   MaxPoolV2Transposer maxpool_transposer;
   auto* maxpool = context.graph_view->GetNode("maxpoolv2");
@@ -1999,80 +2196,93 @@ TEST_F(TransposerTest, MaxPoolV2Transposer) {
 }
 
 TEST_F(TransposerTest, MaxPoolGradV2Transposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
-  GrapplerItem item;
-  Scope scope = Scope::NewRootScope();
-  auto orig_input =
-      ops::RandomUniform(scope.WithOpName("orig_input"),
-                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
-  auto orig_output =
-      ops::RandomUniform(scope.WithOpName("orig_output"),
-                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
-  auto grad =
-      ops::RandomUniform(scope.WithOpName("grad_input"),
-                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
-  auto ksize = ops::Const(scope.WithOpName("ksize"), {1, kKernel, kKernel, 1});
-  auto strides =
-      ops::Const(scope.WithOpName("strides"), {1, kKernel, kKernel, 1});
-  auto maxpoolgrad_op = ops::MaxPoolGradV2(
-      scope.WithOpName("maxpoolgradv2").WithDevice("/device:GPU:0"), orig_input,
-      orig_output, grad, ksize, strides, "VALID");
-  auto z = ops::Identity(scope.WithOpName("z"), maxpoolgrad_op);
-  TF_ASSERT_OK(scope.ToGraphDef(&item.graph));
-  TransposeContext context;
-  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
-      item, virtual_cluster_.get(), &context));
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  for (bool use_grad_grad : {false, true}) {
+    GrapplerItem item;
+    Scope scope = Scope::NewRootScope();
+    auto orig_input =
+        ops::RandomUniform(scope.WithOpName("orig_input"),
+                           {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+    auto orig_output =
+        ops::RandomUniform(scope.WithOpName("orig_output"),
+                           {kBatchSize, use_grad_grad ? kOutHeight : kHeight,
+                            use_grad_grad ? kOutWidth : kWidth, kDepthIn},
+                           DT_FLOAT);
+    auto grad =
+        ops::RandomUniform(scope.WithOpName("grad_input"),
+                           {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+    auto ksize =
+        ops::Const(scope.WithOpName("ksize"), {1, kKernel, kKernel, 1});
+    auto strides =
+        ops::Const(scope.WithOpName("strides"), {1, kKernel, kKernel, 1});
+    Output maxpoolgrad_op;
+    if (use_grad_grad) {
+      maxpoolgrad_op = ops::MaxPoolGradGradV2(
+          scope.WithOpName("maxpoolgradv2").WithDevice("/device:GPU:0"),
+          orig_input, orig_output, grad, ksize, strides, "VALID");
+    } else {
+      maxpoolgrad_op = ops::MaxPoolGradV2(
+          scope.WithOpName("maxpoolgradv2").WithDevice("/device:GPU:0"),
+          orig_input, orig_output, grad, ksize, strides, "VALID");
+    }
+    auto z = ops::Identity(scope.WithOpName("z"), maxpoolgrad_op);
+    TF_ASSERT_OK(scope.ToGraphDef(&item.graph));
+    TransposeContext context;
+    TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+        item, virtual_cluster_.get(), &context));
+    context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
-  MaxPoolGradV2Transposer maxpoolgrad_transposer;
-  auto* maxpoolgrad = context.graph_view->GetNode("maxpoolgradv2");
-  ASSERT_NE(maxpoolgrad, nullptr);
-  TF_ASSERT_OK(maxpoolgrad_transposer.TransposeNode(&context, maxpoolgrad));
+    MaxPoolGradV2Transposer maxpoolgrad_transposer;
+    auto* maxpoolgrad = context.graph_view->GetNode("maxpoolgradv2");
+    ASSERT_NE(maxpoolgrad, nullptr);
+    TF_ASSERT_OK(maxpoolgrad_transposer.TransposeNode(&context, maxpoolgrad));
 
-  auto* orig_input_transpose_node = context.graph_view->GetNode(
-      "maxpoolgradv2-0-TransposeNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(orig_input_transpose_node, nullptr);
-  auto* orig_output_transpose_node = context.graph_view->GetNode(
-      "maxpoolgradv2-1-TransposeNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(orig_output_transpose_node, nullptr);
-  auto* grad_input_transpose_node = context.graph_view->GetNode(
-      "maxpoolgradv2-2-TransposeNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(grad_input_transpose_node, nullptr);
-  auto* size_node = context.graph_view->GetNode(
-      "maxpoolgradv2-3-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(size_node, nullptr);
-  auto* stride_node = context.graph_view->GetNode(
-      "maxpoolgradv2-4-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
-  ASSERT_NE(stride_node, nullptr);
+    auto* orig_input_transpose_node = context.graph_view->GetNode(
+        "maxpoolgradv2-0-TransposeNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(orig_input_transpose_node, nullptr);
+    auto* orig_output_transpose_node = context.graph_view->GetNode(
+        "maxpoolgradv2-1-TransposeNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(orig_output_transpose_node, nullptr);
+    auto* grad_input_transpose_node = context.graph_view->GetNode(
+        "maxpoolgradv2-2-TransposeNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(grad_input_transpose_node, nullptr);
+    auto* size_node = context.graph_view->GetNode(
+        "maxpoolgradv2-3-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(size_node, nullptr);
+    auto* stride_node = context.graph_view->GetNode(
+        "maxpoolgradv2-4-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
+    ASSERT_NE(stride_node, nullptr);
 
-  auto* updated_maxpoolgrad = context.graph_view->GetNode("maxpoolgradv2");
-  ASSERT_NE(updated_maxpoolgrad, nullptr);
-  ASSERT_EQ(updated_maxpoolgrad->NumRegularFanins(), 5);
-  VerifyRegularFaninMatch(updated_maxpoolgrad, 0,
-                          orig_input_transpose_node->GetName(), 0);
-  VerifyRegularFaninMatch(updated_maxpoolgrad, 1,
-                          orig_output_transpose_node->GetName(), 0);
-  VerifyRegularFaninMatch(updated_maxpoolgrad, 2,
-                          grad_input_transpose_node->GetName(), 0);
-  VerifyRegularFaninMatch(updated_maxpoolgrad, 3, size_node->GetName(), 0);
-  VerifyRegularFaninMatch(updated_maxpoolgrad, 4, stride_node->GetName(), 0);
+    auto* updated_maxpoolgrad = context.graph_view->GetNode("maxpoolgradv2");
+    ASSERT_NE(updated_maxpoolgrad, nullptr);
+    ASSERT_EQ(updated_maxpoolgrad->NumRegularFanins(), 5);
+    VerifyRegularFaninMatch(updated_maxpoolgrad, 0,
+                            orig_input_transpose_node->GetName(), 0);
+    VerifyRegularFaninMatch(updated_maxpoolgrad, 1,
+                            orig_output_transpose_node->GetName(), 0);
+    VerifyRegularFaninMatch(updated_maxpoolgrad, 2,
+                            grad_input_transpose_node->GetName(), 0);
+    VerifyRegularFaninMatch(updated_maxpoolgrad, 3, size_node->GetName(), 0);
+    VerifyRegularFaninMatch(updated_maxpoolgrad, 4, stride_node->GetName(), 0);
 
-  auto* output_transpose_node = context.graph_view->GetNode(
-      "maxpoolgradv2-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
-  ASSERT_NE(output_transpose_node, nullptr);
+    auto* output_transpose_node = context.graph_view->GetNode(
+        "maxpoolgradv2-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
+    ASSERT_NE(output_transpose_node, nullptr);
 
-  auto* z_output_node = context.graph_view->GetNode("z");
-  ASSERT_NE(z_output_node, nullptr);
-  ASSERT_EQ(z_output_node->NumRegularFanins(), 1);
-  VerifyRegularFaninMatch(z_output_node, 0, output_transpose_node->GetName(),
-                          0);
+    auto* z_output_node = context.graph_view->GetNode("z");
+    ASSERT_NE(z_output_node, nullptr);
+    ASSERT_EQ(z_output_node->NumRegularFanins(), 1);
+    VerifyRegularFaninMatch(z_output_node, 0, output_transpose_node->GetName(),
+                            0);
+  }
 }
 
 TEST_F(TransposerTest, BinaryOpTransposerAdd) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -2092,6 +2302,7 @@ TEST_F(TransposerTest, BinaryOpTransposerAdd) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2141,9 +2352,9 @@ TEST_F(TransposerTest, BinaryOpTransposerAdd) {
 }
 
 TEST_F(TransposerTest, BinaryOpTransposerMul) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -2163,6 +2374,7 @@ TEST_F(TransposerTest, BinaryOpTransposerMul) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2212,9 +2424,9 @@ TEST_F(TransposerTest, BinaryOpTransposerMul) {
 }
 
 TEST_F(TransposerTest, BinaryOpTransposerPolygamma) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -2236,6 +2448,7 @@ TEST_F(TransposerTest, BinaryOpTransposerPolygamma) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2298,9 +2511,9 @@ bool CreateConcatV1Op(const Scope& scope, const InputList& tensors,
 }
 
 TEST_F(TransposerTest, ConcatOpTransposerConcat) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   Output input_1 = ops::RandomUniform(scope.WithOpName("input_1"),
@@ -2327,6 +2540,7 @@ TEST_F(TransposerTest, ConcatOpTransposerConcat) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2375,9 +2589,9 @@ TEST_F(TransposerTest, ConcatOpTransposerConcat) {
 }
 
 TEST_F(TransposerTest, ConcatOpTransposerConcatV2) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   Output input_1 = ops::RandomUniform(scope.WithOpName("input_1"),
@@ -2403,6 +2617,7 @@ TEST_F(TransposerTest, ConcatOpTransposerConcatV2) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2451,9 +2666,9 @@ TEST_F(TransposerTest, ConcatOpTransposerConcatV2) {
 }
 
 TEST_F(TransposerTest, ReverseV2Transposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -2475,6 +2690,7 @@ TEST_F(TransposerTest, ReverseV2Transposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2518,9 +2734,9 @@ TEST_F(TransposerTest, ReverseV2Transposer) {
 }
 
 TEST_F(TransposerTest, TileTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -2542,6 +2758,7 @@ TEST_F(TransposerTest, TileTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2584,9 +2801,9 @@ TEST_F(TransposerTest, TileTransposer) {
 }
 
 TEST_F(TransposerTest, ShapeTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -2607,6 +2824,7 @@ TEST_F(TransposerTest, ShapeTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2640,9 +2858,9 @@ TEST_F(TransposerTest, ShapeTransposer) {
 }
 
 TEST_F(TransposerTest, ShapeNTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -2672,6 +2890,7 @@ TEST_F(TransposerTest, ShapeNTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d_1 = context.graph_view->GetNode("conv2d_1");
@@ -2742,9 +2961,9 @@ TEST_F(TransposerTest, ShapeNTransposer) {
 }
 
 TEST_F(TransposerTest, FillOpTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
   auto input =
@@ -2766,6 +2985,7 @@ TEST_F(TransposerTest, FillOpTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2800,9 +3020,9 @@ TEST_F(TransposerTest, FillOpTransposer) {
 }
 
 TEST_F(TransposerTest, SliceTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -2826,6 +3046,7 @@ TEST_F(TransposerTest, SliceTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2876,9 +3097,9 @@ TEST_F(TransposerTest, SliceTransposer) {
 }
 
 TEST_F(TransposerTest, SplitTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -2902,6 +3123,7 @@ TEST_F(TransposerTest, SplitTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -2961,9 +3183,9 @@ TEST_F(TransposerTest, SplitTransposer) {
 }
 
 TEST_F(TransposerTest, SplitVTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -2990,6 +3212,7 @@ TEST_F(TransposerTest, SplitVTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -3050,9 +3273,9 @@ TEST_F(TransposerTest, SplitVTransposer) {
 }
 
 TEST_F(TransposerTest, StridedSliceTransposer) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -3068,9 +3291,9 @@ TEST_F(TransposerTest, StridedSliceTransposer) {
 
   auto attrs = ops::StridedSlice::Attrs().BeginMask(0xB).EndMask(0x7);
 
-  auto begin = ops::Const(scope.WithOpName("begin"), {2, 0, 2}, {3});
-  auto end = ops::Const(scope.WithOpName("end"), {34, 4, 3}, {3});
-  auto strides = ops::Const(scope.WithOpName("strides"), {7, 2, 1}, {3});
+  auto begin = ops::Const(scope.WithOpName("begin"), {2, 0, 2, 1}, {4});
+  auto end = ops::Const(scope.WithOpName("end"), {34, 4, 3, 1}, {4});
+  auto strides = ops::Const(scope.WithOpName("strides"), {7, 2, 1, 1}, {4});
 
   auto strided_slice_op = ops::StridedSlice(
       scope.WithOpName("stridedslice").WithDevice("/device:GPU:0"), conv2d,
@@ -3081,6 +3304,7 @@ TEST_F(TransposerTest, StridedSliceTransposer) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -3139,9 +3363,9 @@ TEST_F(TransposerTest, StridedSliceTransposer) {
 }
 
 TEST_F(TransposerTest, StridedSliceTransposerEllipsisMaskPresent) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -3158,9 +3382,9 @@ TEST_F(TransposerTest, StridedSliceTransposerEllipsisMaskPresent) {
   auto attrs =
       ops::StridedSlice::Attrs().BeginMask(0xB).EndMask(0x7).EllipsisMask(0x2);
 
-  auto begin = ops::Const(scope.WithOpName("begin"), {2, 0, 2}, {3});
-  auto end = ops::Const(scope.WithOpName("end"), {34, 4, 3}, {3});
-  auto strides = ops::Const(scope.WithOpName("strides"), {7, 2, 1}, {3});
+  auto begin = ops::Const(scope.WithOpName("begin"), {2, 0, 2, 1}, {4});
+  auto end = ops::Const(scope.WithOpName("end"), {34, 4, 3, 1}, {4});
+  auto strides = ops::Const(scope.WithOpName("strides"), {7, 2, 1, 1}, {4});
 
   auto strided_slice_op = ops::StridedSlice(
       scope.WithOpName("stridedslice").WithDevice("/device:GPU:0"), conv2d,
@@ -3171,6 +3395,7 @@ TEST_F(TransposerTest, StridedSliceTransposerEllipsisMaskPresent) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -3199,10 +3424,95 @@ TEST_F(TransposerTest, StridedSliceTransposerEllipsisMaskPresent) {
                           updated_stridedslice_node->GetName(), 0);
 }
 
+TEST_F(TransposerTest, StridedSliceTransposerConstFaninBadRank) {
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GrapplerItem item;
+  Scope scope = Scope::NewRootScope();
+
+  auto input =
+      ops::RandomUniform(scope.WithOpName("input"),
+                         {kBatchSize, kHeight, kWidth, kDepthIn}, DT_FLOAT);
+  auto filter =
+      ops::RandomUniform(scope.WithOpName("filter"),
+                         {kHeight, kWidth, kDepthIn, kDepthOut}, DT_FLOAT);
+  Output conv2d = ops::Conv2D(
+      scope.WithOpName("conv2d").WithDevice("/device:GPU:0"), input, filter,
+      {1, 2, 4, 1}, "SAME", ops::Conv2D::DataFormat(kSrcFormat));
+
+  auto attrs = ops::StridedSlice::Attrs().BeginMask(0xB).EndMask(0x7);
+
+  auto begin = ops::Const(scope.WithOpName("begin"), {2, 0, 2}, {3});
+  auto end = ops::Const(scope.WithOpName("end"), {34, 4, 3}, {3});
+  auto strides = ops::Const(scope.WithOpName("strides"), {7, 2, 1}, {3});
+
+  auto strided_slice_op = ops::StridedSlice(
+      scope.WithOpName("stridedslice").WithDevice("/device:GPU:0"), conv2d,
+      begin, end, strides, attrs);
+  auto z = ops::Identity(scope.WithOpName("z"), strided_slice_op);
+  TF_ASSERT_OK(scope.ToGraphDef(&item.graph));
+
+  TransposeContext context;
+  TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
+      item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
+
+  DefaultLayoutSensitiveOpTransposer conv2d_transposer;
+  auto* c2d = context.graph_view->GetNode("conv2d");
+  ASSERT_NE(c2d, nullptr);
+  TF_ASSERT_OK(conv2d_transposer.TransposeNode(&context, c2d));
+
+  StridedSliceTransposer stridedslice_transposer;
+  auto* stridedslice = context.graph_view->GetNode("stridedslice");
+  ASSERT_NE(stridedslice, nullptr);
+  TF_ASSERT_OK(stridedslice_transposer.TransposeNode(&context, stridedslice));
+
+  auto* input_transpose_node = context.graph_view->GetNode(
+      "stridedslice-0-TransposeNHWCToNCHW-LayoutOptimizer");
+  ASSERT_EQ(input_transpose_node, nullptr);
+
+  auto* begin_node = context.graph_view->GetNode(
+      "stridedslice-1-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
+  ASSERT_EQ(begin_node, nullptr);
+  auto* end_node = context.graph_view->GetNode(
+      "stridedslice-2-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
+  ASSERT_EQ(end_node, nullptr);
+  auto* strides_node = context.graph_view->GetNode(
+      "stridedslice-3-DataFormatVecPermuteNHWCToNCHW-LayoutOptimizer");
+  ASSERT_EQ(strides_node, nullptr);
+
+  auto* updated_stridedslice_node = context.graph_view->GetNode("stridedslice");
+  ASSERT_NE(updated_stridedslice_node, nullptr);
+  ASSERT_EQ(updated_stridedslice_node->NumRegularFanins(), 4);
+  VerifyRegularFaninMatch(updated_stridedslice_node, 0,
+                          "conv2d-0-0-TransposeNCHWToNHWC-LayoutOptimizer", 0);
+  VerifyRegularFaninMatch(updated_stridedslice_node, 1, "begin", 0);
+  VerifyRegularFaninMatch(updated_stridedslice_node, 2, "end", 0);
+  VerifyRegularFaninMatch(updated_stridedslice_node, 3, "strides", 0);
+  const auto* begin_mask_attr =
+      updated_stridedslice_node->GetAttr("begin_mask");
+  ASSERT_NE(begin_mask_attr, nullptr);
+  EXPECT_EQ(begin_mask_attr->i(), 0xB);
+  const auto* end_mask_attr = updated_stridedslice_node->GetAttr("end_mask");
+  ASSERT_NE(end_mask_attr, nullptr);
+  EXPECT_EQ(end_mask_attr->i(), 0x7);
+
+  auto* output_transpose_node = context.graph_view->GetNode(
+      "stridedslice-0-0-TransposeNCHWToNHWC-LayoutOptimizer");
+  ASSERT_EQ(output_transpose_node, nullptr);
+
+  auto* z_output_node = context.graph_view->GetNode("z");
+  ASSERT_NE(z_output_node, nullptr);
+  ASSERT_EQ(z_output_node->NumRegularFanins(), 1);
+  VerifyRegularFaninMatch(z_output_node, 0,
+                          updated_stridedslice_node->GetName(), 0);
+}
+
 TEST_F(TransposerTest, ReduceTransposerKeepDims) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -3227,6 +3537,7 @@ TEST_F(TransposerTest, ReduceTransposerKeepDims) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -3266,9 +3577,9 @@ TEST_F(TransposerTest, ReduceTransposerKeepDims) {
 }
 
 TEST_F(TransposerTest, ReduceTransposerValidAxisNode) {
-#if !GOOGLE_CUDA
-  GTEST_SKIP() << "CUDA is not enabled";
-#endif  // !GOOGLE_CUDA
+#if !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
+  GTEST_SKIP() << "Neither CUDA nor ROCm is enabled";
+#endif  // !(GOOGLE_CUDA || TENSORFLOW_USE_ROCM)
   GrapplerItem item;
   Scope scope = Scope::NewRootScope();
 
@@ -3292,6 +3603,7 @@ TEST_F(TransposerTest, ReduceTransposerValidAxisNode) {
   TransposeContext context;
   TF_ASSERT_OK(TransposeContext::InitializeTransposeContext(
       item, virtual_cluster_.get(), &context));
+  context.AssignDeviceAndDataFormats(kGPU, kSrcFormat, kDstFormat);
 
   DefaultLayoutSensitiveOpTransposer conv2d_transposer;
   auto* c2d = context.graph_view->GetNode("conv2d");
@@ -3328,7 +3640,7 @@ TEST_F(TransposerTest, ReduceTransposerValidAxisNode) {
 TEST(PermutationTest, PermutesVector) {
   std::vector<int64> input{32, 16, 8, 4};
   std::vector<int64> expected{4, 8, 16, 32};
-  TF_ASSERT_OK(Permute({3, 2, 1, 0}, &input));
+  TF_ASSERT_OK(PermuteSingle("test", {3, 2, 1, 0}, &input));
   ASSERT_EQ(input.size(), 4);
   for (int i = 0; i < input.size(); ++i) {
     EXPECT_EQ(input[i], expected[i]);
@@ -3339,28 +3651,57 @@ TEST(PermutationTest, PermutesRepeatedField) {
   TensorShapeProto input_shape = MakeTensorShapeFromDimensions({1, 2, 3, 4});
   TensorShapeProto expected_shape = MakeTensorShapeFromDimensions({1, 4, 2, 3});
 
-  TF_ASSERT_OK(Permute({0, 3, 1, 2}, input_shape.mutable_dim()));
+  TF_ASSERT_OK(PermuteSingle("test", {0, 3, 1, 2}, input_shape.mutable_dim()));
   EXPECT_EQ(input_shape.DebugString(), expected_shape.DebugString());
+}
+
+TEST(PermutationTest, PermutesDoubleRepeatedField) {
+  {
+    // NHWC -> NCHW
+    TensorShapeProto input =
+        MakeTensorShapeFromDimensions({1, 2, 3, 4, 5, 6, 7, 8});
+    TensorShapeProto expected =
+        MakeTensorShapeFromDimensions({1, 2, 7, 8, 3, 4, 5, 6});
+
+    TF_ASSERT_OK(PermuteDouble("test", {0, 3, 1, 2}, input.mutable_dim()));
+    EXPECT_EQ(input.DebugString(), expected.DebugString());
+  }
+  {
+    // NCHW -> NHWC
+    TensorShapeProto input =
+        MakeTensorShapeFromDimensions({1, 2, 3, 4, 5, 6, 7, 8});
+    TensorShapeProto expected =
+        MakeTensorShapeFromDimensions({1, 2, 5, 6, 7, 8, 3, 4});
+    TF_ASSERT_OK(PermuteDouble("test", {0, 2, 3, 1}, input.mutable_dim()));
+    EXPECT_EQ(input.DebugString(), expected.DebugString());
+  }
 }
 
 TEST(PermutationTest, PermutesDataFormat) {
   string input = "NHWC";
   string expected = "NCHW";
-  TF_ASSERT_OK(Permute({0, 3, 1, 2}, &input));
+  TF_ASSERT_OK(PermuteSingle("test", {0, 3, 1, 2}, &input));
   EXPECT_EQ(input, expected);
 }
 
 TEST(PermutationTest, PermutesString) {
   string input = "ABCD";
   string expected = "ACBD";
-  TF_ASSERT_OK(Permute({0, 2, 1, 3}, &input));
+  TF_ASSERT_OK(PermuteSingle("test", {0, 2, 1, 3}, &input));
   EXPECT_EQ(input, expected);
 }
 
 TEST(PermutationTest, GetNHWCToNCHWPermutation) {
   string src_format = "NHWC";
+  absl::flat_hash_map<char, int> src_dim_indices =
+      GetDimensionIndices(src_format);
+  EXPECT_EQ(src_dim_indices.size(), 4);
+  EXPECT_EQ(src_dim_indices['N'], 0);
+  EXPECT_EQ(src_dim_indices['H'], 1);
+  EXPECT_EQ(src_dim_indices['W'], 2);
+  EXPECT_EQ(src_dim_indices['C'], 3);
   string dst_format = "NCHW";
-  std::vector<int> permutation = GetPermutation(src_format, dst_format);
+  std::vector<int> permutation = GetPermutation(src_dim_indices, dst_format);
   ASSERT_EQ(permutation.size(), 4);
   EXPECT_EQ(permutation[0], 0);
   EXPECT_EQ(permutation[1], 3);
@@ -3370,8 +3711,15 @@ TEST(PermutationTest, GetNHWCToNCHWPermutation) {
 
 TEST(PermutationTest, GetNCHWToNHWCPermutation) {
   string src_format = "NCHW";
+  absl::flat_hash_map<char, int> src_dim_indices =
+      GetDimensionIndices(src_format);
+  EXPECT_EQ(src_dim_indices.size(), 4);
+  EXPECT_EQ(src_dim_indices['N'], 0);
+  EXPECT_EQ(src_dim_indices['C'], 1);
+  EXPECT_EQ(src_dim_indices['H'], 2);
+  EXPECT_EQ(src_dim_indices['W'], 3);
   string dst_format = "NHWC";
-  std::vector<int> permutation = GetPermutation(src_format, dst_format);
+  std::vector<int> permutation = GetPermutation(src_dim_indices, dst_format);
   ASSERT_EQ(permutation.size(), 4);
   EXPECT_EQ(permutation[0], 0);
   EXPECT_EQ(permutation[1], 2);

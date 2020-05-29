@@ -46,8 +46,8 @@ public final class NativeInterpreterWrapperTest {
   private static final String STRING_MODEL_PATH =
       "tensorflow/lite/java/src/testdata/string.bin";
 
-  private static final String QUANTIZED_MODEL_PATH =
-      "tensorflow/lite/java/src/testdata/quantized.bin";
+  private static final String STRING_SCALAR_MODEL_PATH =
+      "tensorflow/lite/java/src/testdata/string_scalar.bin";
 
   private static final String INVALID_MODEL_PATH =
       "tensorflow/lite/java/src/testdata/invalid_model.bin";
@@ -249,6 +249,20 @@ public final class NativeInterpreterWrapperTest {
   }
 
   @Test
+  public void testRunWithScalarString() {
+    try (NativeInterpreterWrapper wrapper =
+        new NativeInterpreterWrapper(STRING_SCALAR_MODEL_PATH)) {
+      String[] parsedOutputs = new String[1];
+      Map<Integer, Object> outputs = new HashMap<>();
+      outputs.put(0, parsedOutputs);
+      Object[] inputs = {"s1"};
+      wrapper.run(inputs, outputs);
+      String[] expected = {"s1"};
+      assertThat(parsedOutputs).isEqualTo(expected);
+    }
+  }
+
+  @Test
   public void testRunWithString_supplementaryUnicodeCharacters() {
     try (NativeInterpreterWrapper wrapper = new NativeInterpreterWrapper(STRING_MODEL_PATH)) {
       String[] oneD = {"\uD800\uDC01", "s22", "\ud841\udf0e"};
@@ -352,7 +366,7 @@ public final class NativeInterpreterWrapperTest {
             .hasMessageThat()
             .contains(
                 "Cannot convert between a TensorFlowLite buffer with 768 bytes and a "
-                    + "ByteBuffer with 3072 bytes.");
+                    + "Java Buffer with 3072 bytes.");
       }
       int[] inputDims = {4, 8, 8, 3};
       wrapper.resizeInput(0, inputDims);
@@ -380,7 +394,7 @@ public final class NativeInterpreterWrapperTest {
             .hasMessageThat()
             .contains(
                 "Cannot convert between a TensorFlowLite buffer with 192 bytes and a "
-                    + "ByteBuffer with 336 bytes.");
+                    + "Java Buffer with 336 bytes.");
       }
     }
   }
@@ -559,18 +573,6 @@ public final class NativeInterpreterWrapperTest {
     try (NativeInterpreterWrapper wrapper = new NativeInterpreterWrapper(FLOAT_MODEL_PATH)) {
       int[] expectedDims = {1, 8, 8, 3};
       assertThat(wrapper.getInputTensor(0).shape()).isEqualTo(expectedDims);
-    }
-  }
-
-  @Test
-  public void testGetOutputQuantizationParams() {
-    try (NativeInterpreterWrapper wrapper = new NativeInterpreterWrapper(FLOAT_MODEL_PATH)) {
-      assertThat(wrapper.getOutputQuantizationZeroPoint(0)).isEqualTo(0);
-      assertThat(wrapper.getOutputQuantizationScale(0)).isWithin(1e-6f).of(0.0f);
-    }
-    try (NativeInterpreterWrapper wrapper = new NativeInterpreterWrapper(QUANTIZED_MODEL_PATH)) {
-      assertThat(wrapper.getOutputQuantizationZeroPoint(0)).isEqualTo(127);
-      assertThat(wrapper.getOutputQuantizationScale(0)).isWithin(1e-6f).of(0.25f);
     }
   }
 }

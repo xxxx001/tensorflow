@@ -24,25 +24,24 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "tensorflow/lite/delegates/gpu/common/status.h"
 #include "tensorflow/lite/delegates/gpu/common/types.h"
+#include "tensorflow/lite/delegates/gpu/gl/variable.h"
 
 namespace tflite {
 namespace gpu {
 namespace gl {
 namespace {
 
-Status GenerateMaxPoolingCode(const Pooling2DAttributes& attr,
-                              const NodeShader::GenerationContext& ctx,
-                              GeneratedCode* generated_code) {
-  auto input = ctx.graph->FindInputs(ctx.node->id)[0];
-
+absl::Status GenerateMaxPoolingCode(const Pooling2DAttributes& attr,
+                                    const NodeShader::GenerationContext& ctx,
+                                    GeneratedCode* generated_code) {
   if (attr.padding.prepended.h > attr.kernel.h ||
       attr.padding.prepended.w > attr.kernel.w) {
-    return InvalidArgumentError("Padding is bigger than kernel.");
+    return absl::InvalidArgumentError("Padding is bigger than kernel.");
   }
 
-  std::vector<UniformParameter> parameters = {
-      {"input_data_0_h", input->tensor.shape.h},
-      {"input_data_0_w", input->tensor.shape.w},
+  std::vector<Variable> parameters = {
+      {"input_data_0_h", static_cast<int>(ctx.input_shapes[0][1])},
+      {"input_data_0_w", static_cast<int>(ctx.input_shapes[0][2])},
       {"stride", int2(attr.strides.w, attr.strides.h)},
       {"offset", int2(attr.padding.prepended.w, attr.padding.prepended.h)},
       {"window_h", attr.kernel.h},
@@ -86,23 +85,22 @@ Status GenerateMaxPoolingCode(const Pooling2DAttributes& attr,
   *generated_code = {
       /*parameters=*/std::move(parameters),
       /*objects=*/{},
+      /*shared_variables=*/{},
       /*workload=*/uint3(),
       /*workgroup=*/uint3(),
       /*source_code=*/std::move(source),
       /*input=*/IOStructure::ONLY_DEFINITIONS,
       /*output=*/IOStructure::AUTO,
   };
-  return OkStatus();
+  return absl::OkStatus();
 }
 
-Status GenerateAveragePoolingCode(const Pooling2DAttributes& attr,
-                                  const NodeShader::GenerationContext& ctx,
-                                  GeneratedCode* generated_code) {
-  auto input = ctx.graph->FindInputs(ctx.node->id)[0];
-
-  std::vector<UniformParameter> parameters = {
-      {"input_data_0_h", input->tensor.shape.h},
-      {"input_data_0_w", input->tensor.shape.w},
+absl::Status GenerateAveragePoolingCode(
+    const Pooling2DAttributes& attr, const NodeShader::GenerationContext& ctx,
+    GeneratedCode* generated_code) {
+  std::vector<Variable> parameters = {
+      {"input_data_0_h", static_cast<int>(ctx.input_shapes[0][1])},
+      {"input_data_0_w", static_cast<int>(ctx.input_shapes[0][2])},
       {"stride", int2(attr.strides.w, attr.strides.h)},
       {"offset", int2(attr.padding.prepended.w, attr.padding.prepended.h)},
       {"window_h", attr.kernel.h},
@@ -127,28 +125,28 @@ Status GenerateAveragePoolingCode(const Pooling2DAttributes& attr,
   *generated_code = {
       /*parameters=*/std::move(parameters),
       /*objects=*/{},
+      /*shared_variables=*/{},
       /*workload=*/uint3(),
       /*workgroup=*/uint3(),
       /*source_code=*/std::move(source),
       /*input=*/IOStructure::ONLY_DEFINITIONS,
       /*output=*/IOStructure::AUTO,
   };
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 class Pooling : public NodeShader {
  public:
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
-    const auto& attr =
-        absl::any_cast<Pooling2DAttributes>(ctx.node->operation.attributes);
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
+    const auto& attr = absl::any_cast<const Pooling2DAttributes&>(ctx.op_attr);
     switch (attr.type) {
       case PoolingType::AVERAGE:
         return GenerateAveragePoolingCode(attr, ctx, generated_code);
       case PoolingType::MAX:
         return GenerateMaxPoolingCode(attr, ctx, generated_code);
       default:
-        return InvalidArgumentError("Incorrect attributes' type.");
+        return absl::InvalidArgumentError("Incorrect attributes' type.");
     }
   }
 };

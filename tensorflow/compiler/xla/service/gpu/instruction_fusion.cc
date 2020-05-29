@@ -16,9 +16,11 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/gpu/instruction_fusion.h"
 
 #include "absl/container/flat_hash_set.h"
+#include "tensorflow/compiler/xla/service/fusion_node_indexing_evaluation.h"
 #include "tensorflow/compiler/xla/service/gpu/gpu_fusible.h"
 #include "tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
+#include "tensorflow/compiler/xla/service/hlo_query.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/fused_ir_emitter.h"
 #include "tensorflow/compiler/xla/service/pattern_matcher.h"
 #include "tensorflow/compiler/xla/shape_util.h"
@@ -27,103 +29,21 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-namespace {
-
-bool IsIEEEFloatingPointScalarConstant(const HloInstruction* constant) {
-  if (constant->opcode() != HloOpcode::kConstant ||
-      !ShapeUtil::IsScalar(constant->shape())) {
-    return false;
-  }
-  auto type = constant->shape().element_type();
-  return type == F16 || type == F32 || type == F64;
-}
-
-}  // namespace
-
 /*static*/ bool GpuInstructionFusion::IsExpensive(
     const HloInstruction& instruction) {
-  switch (instruction.opcode()) {
-    // We say that floating-point division is cheap on the GPU.
-    case HloOpcode::kDivide:
-      return !ShapeUtil::ElementIsFloating(instruction.shape()) &&
-             InstructionFusion::IsExpensive(instruction);
-
-    default:
-      return InstructionFusion::IsExpensive(instruction);
+  // We say that floating-point division is cheap on the GPU.
+  if (instruction.opcode() == HloOpcode::kDivide &&
+      ShapeUtil::ElementIsFloating(instruction.shape())) {
+    return false;
   }
+  return InstructionFusion::IsExpensive(instruction);
 }
 
 bool GpuInstructionFusion::ShouldFuseInexpensiveChecks(HloInstruction* consumer,
                                                        int64 operand_index) {
   HloInstruction* producer = consumer->mutable_operand(operand_index);
 
-  // Check if we can use output fusion for (A @ B) * alpha
-  if (producer->opcode() == HloOpcode::kDot && ImplementedAsGemm(*producer)) {
-    int64 other_operand_index = 1 - operand_index;
-    HloInstruction* op1 = nullptr;
-    HloInstruction* op2 = nullptr;
-    if (consumer->operand_count() == 1 && consumer->IsLoopFusion() &&
-        Match(consumer->fused_expression_root(),
-              match::Op()
-                  .WithOpcode(HloOpcode::kMultiply)
-                  .WithOperand(0, match::Op(&op1))
-                  .WithOperand(1, match::Op(&op2)))) {
-      CHECK(op1 != nullptr && op2 != nullptr);
-      // If 'consumer' is a fusion node, it should consist of a broadcast of a
-      // scalar constant fused into a multiply, but nothing more. So one operand
-      // should be a parameter, and the other should be a broadcast.
-      if (op1->opcode() != HloOpcode::kParameter) {
-        std::swap(op1, op2);
-      }
-      if (op1->opcode() != HloOpcode::kParameter ||
-          op2->opcode() != HloOpcode::kBroadcast) {
-        return false;
-      }
-      if (IsIEEEFloatingPointScalarConstant(op2->operand(0))) {
-        return true;
-      }
-    } else if (consumer->operand_count() == 2 &&
-               consumer->opcode() == HloOpcode::kMultiply) {
-      const HloInstruction* alpha = consumer->operand(other_operand_index);
-      // Fuse if 'alpha' is a broadcast of a scalar constant.
-      if (alpha->opcode() == HloOpcode::kBroadcast &&
-          alpha->dimensions().empty() &&
-          IsIEEEFloatingPointScalarConstant(alpha->operand(0))) {
-        return true;
-      }
-    } else if (consumer->operand_count() == 2 &&
-               consumer->opcode() == HloOpcode::kAdd &&
-               consumer->operand(other_operand_index) != producer) {
-      // Fuse a bias add into the output of the dot.
-      return true;
-    }
-  }
-
-  // Only allow fusing transpose or broadcast into an output fusion that is
-  // implemented as a Gemm call.
-  if (consumer->IsOutputFusion() && ImplementedAsGemm(*consumer)) {
-    auto producer_operand_index = consumer->operand_index(producer);
-    auto fused_parameter = consumer->fused_parameter(producer_operand_index);
-    const std::vector<HloInstruction*>& fused_parameter_users =
-        fused_parameter->users();
-    if (fused_parameter_users.size() != 1) {
-      return false;
-    }
-    if (producer->opcode() == HloOpcode::kTranspose) {
-      // Check that the transpose is an operand of a dot.
-      return fused_parameter_users[0]->opcode() == HloOpcode::kDot;
-    }
-    if (producer->opcode() == HloOpcode::kBroadcast) {
-      // Check that the broadcast is a broadcast of a scalar constant into a
-      // multiply.
-      return producer->dimensions().empty() &&
-             IsIEEEFloatingPointScalarConstant(producer->operand(0)) &&
-             fused_parameter_users[0]->opcode() == HloOpcode::kMultiply;
-    }
-    return false;
-  }
-
-  // Other output fusions are not currently supported on GPUs.
+  // Output fusions are not currently supported on GPUs.
   if (producer->opcode() == HloOpcode::kFusion) {
     return false;
   }
@@ -145,23 +65,35 @@ bool GpuInstructionFusion::ShouldFuseInexpensiveChecks(HloInstruction* consumer,
 bool GpuInstructionFusion::ShouldFuse(HloInstruction* consumer,
                                       int64 operand_index) {
   if (!ShouldFuseInexpensiveChecks(consumer, operand_index)) {
+    VLOG(5) << "Not fusing inexpensive checks of operand " << operand_index
+            << " of " << consumer->ToString();
     return false;
   }
   auto producer = consumer->operand(operand_index);
 
-  // TODO(b/129089333): Don't fuse variadic reduce.
-  if (consumer->opcode() == HloOpcode::kReduce && consumer->shape().IsTuple()) {
-    return false;
-  }
   // The following checks are potentially expensive.
   if (FusionWouldBeTooLarge(*consumer, *producer)) {
+    VLOG(5) << "Fusion of (" << producer->ToString() << ") into ("
+            << consumer->ToString() << ") would be too large";
     return false;
+  }
+  if (consumer->opcode() != HloOpcode::kFusion) {
+    return true;
   }
   // Also check that our emitter can handle the fusion node. We currently can
   // have exponential time/memory requirements for emitting certain fusion
   // kernels, in which case we don't want to fuse.
   // TODO(b/119692968): Remove this once we have fixed our fusion emitter.
-  return !FusedIrEmitter::IsFusedIrEmitterInefficient(consumer, producer);
+  if (fusion_node_evaluations_.find(consumer) ==
+      fusion_node_evaluations_.end()) {
+    // We have no cached results for this fusion node yet. This can happen when
+    // we run the InstructionFusion pass more than once. We can only cache the
+    // results within one run.
+    fusion_node_evaluations_.emplace(consumer,
+                                     FusionNodeIndexingEvaluation(consumer));
+  }
+  return !fusion_node_evaluations_.at(consumer).AverageCodeDuplicationTooHigh(
+      producer);
 }
 
 bool GpuInstructionFusion::ShouldFuseIntoMultiOutput(HloInstruction* consumer,
@@ -171,19 +103,23 @@ bool GpuInstructionFusion::ShouldFuseIntoMultiOutput(HloInstruction* consumer,
 
 HloInstruction::FusionKind GpuInstructionFusion::ChooseKind(
     const HloInstruction* producer, const HloInstruction* consumer) {
-  if (IsReductionFromOrToContiguousDimensions(*consumer) ||
-      consumer->opcode() == HloOpcode::kScatter) {
-    return HloInstruction::FusionKind::kInput;
+  return ChooseFusionKind(*producer, *consumer);
+}
+
+HloInstruction* GpuInstructionFusion::FuseInstruction(
+    HloInstruction* fusion_instruction, HloInstruction* producer) {
+  auto evaluation = fusion_node_evaluations_.find(fusion_instruction);
+  if (evaluation == fusion_node_evaluations_.end()) {
+    evaluation = fusion_node_evaluations_
+                     .emplace(fusion_instruction,
+                              FusionNodeIndexingEvaluation(fusion_instruction))
+                     .first;
   }
-  if (producer->opcode() == HloOpcode::kDot ||
-      (producer->opcode() == HloOpcode::kFusion &&
-       producer->fused_expression_root()->opcode() == HloOpcode::kDot)) {
-    return HloInstruction::FusionKind::kOutput;
-  }
-  if (HloOpcode::kFusion == consumer->opcode()) {
-    return consumer->fusion_kind();
-  }
-  return InstructionFusion::ChooseKind(producer, consumer);
+  auto indexing_users = evaluation->second.RemoveFusionOperand(producer);
+  HloInstruction* new_producer =
+      InstructionFusion::FuseInstruction(fusion_instruction, producer);
+  evaluation->second.UpdateEvaluationCache(new_producer, indexing_users);
+  return new_producer;
 }
 
 }  // namespace gpu

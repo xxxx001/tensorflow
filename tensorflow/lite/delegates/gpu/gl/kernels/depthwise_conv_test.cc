@@ -31,7 +31,7 @@ namespace gl {
 namespace {
 
 TEST(DepthwiseConvTest, O4H1W1I2Strides1x1Dilation1x1) {
-  TensorRefFloat32 input;
+  TensorRef<BHWC> input;
   input.type = DataType::FLOAT32;
   input.ref = 0;
   input.shape = BHWC(1, 1, 1, 2);
@@ -55,21 +55,21 @@ TEST(DepthwiseConvTest, O4H1W1I2Strides1x1Dilation1x1) {
   attr.padding.appended = HW(0, 0);
   attr.strides = HW(1, 1);
 
-  TensorRefFloat32 output;
+  TensorRef<BHWC> output;
   output.type = DataType::FLOAT32;
   output.ref = 3;
   output.shape = BHWC(1, 1, 1, 4);
 
   SingleOpModel model(
-      {ToString(OperationType::CONVOLUTION_2D), std::move(attr)}, {input},
-      {output});
+      {ToString(OperationType::DEPTHWISE_CONVOLUTION), std::move(attr)},
+      {input}, {output});
   ASSERT_TRUE(model.PopulateTensor(0, {1, 3}));
   ASSERT_OK(model.Invoke(*NewDepthwiseConvolutionNodeShader()));
   EXPECT_THAT(model.GetOutput(0), Pointwise(FloatNear(1e-6), {2, 4, 12, 16}));
 }
 
 TEST(DepthwiseConvTest, O2H1W1I1Strides2x2Dilation1x1) {
-  TensorRefFloat32 input;
+  TensorRef<BHWC> input;
   input.type = DataType::FLOAT32;
   input.ref = 0;
   input.shape = BHWC(1, 3, 3, 1);
@@ -93,14 +93,14 @@ TEST(DepthwiseConvTest, O2H1W1I1Strides2x2Dilation1x1) {
   attr.padding.appended = HW(0, 0);
   attr.strides = HW(2, 2);
 
-  TensorRefFloat32 output;
+  TensorRef<BHWC> output;
   output.type = DataType::FLOAT32;
   output.ref = 3;
   output.shape = BHWC(1, 2, 2, 2);
 
   SingleOpModel model(
-      {ToString(OperationType::CONVOLUTION_2D), std::move(attr)}, {input},
-      {output});
+      {ToString(OperationType::DEPTHWISE_CONVOLUTION), std::move(attr)},
+      {input}, {output});
   ASSERT_TRUE(model.PopulateTensor(0, {1, 0, 1, 1, 0, 1, 1, 0, 1}));
   ASSERT_OK(model.Invoke(*NewDepthwiseConvolutionNodeShader()));
   EXPECT_THAT(model.GetOutput(0),
@@ -108,7 +108,7 @@ TEST(DepthwiseConvTest, O2H1W1I1Strides2x2Dilation1x1) {
 }
 
 TEST(DepthwiseConvTest, O2H2W2I1Strides1x1Dilation2x2) {
-  TensorRefFloat32 input;
+  TensorRef<BHWC> input;
   input.type = DataType::FLOAT32;
   input.ref = 0;
   input.shape = BHWC(1, 3, 3, 1);
@@ -132,14 +132,14 @@ TEST(DepthwiseConvTest, O2H2W2I1Strides1x1Dilation2x2) {
   attr.padding.appended = HW(0, 0);
   attr.strides = HW(1, 1);
 
-  TensorRefFloat32 output;
+  TensorRef<BHWC> output;
   output.type = DataType::FLOAT32;
   output.ref = 3;
   output.shape = BHWC(1, 1, 1, 2);
 
   SingleOpModel model(
-      {ToString(OperationType::CONVOLUTION_2D), std::move(attr)}, {input},
-      {output});
+      {ToString(OperationType::DEPTHWISE_CONVOLUTION), std::move(attr)},
+      {input}, {output});
   ASSERT_TRUE(model.PopulateTensor(0, {1, 0, 1, 1, 0, 1, 1, 0, 1}));
   ASSERT_OK(model.Invoke(*NewDepthwiseConvolutionNodeShader()));
   EXPECT_THAT(model.GetOutput(0), Pointwise(FloatNear(1e-6), {10, 26}));

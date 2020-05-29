@@ -44,12 +44,9 @@ class SelectOp : public OpKernel {
   explicit SelectOp(OpKernelConstruction* context) : OpKernel(context) {}
 
   void Compute(OpKernelContext* ctx) override {
-    const Tensor* cond;
-    const Tensor* then;
-    const Tensor* else_;
-    OP_REQUIRES_OK(ctx, ctx->input("condition", &cond));
-    OP_REQUIRES_OK(ctx, ctx->input("t", &then));
-    OP_REQUIRES_OK(ctx, ctx->input("e", &else_));
+    const Tensor* cond = &ctx->input(0);
+    const Tensor* then = &ctx->input(1);
+    const Tensor* else_ = &ctx->input(2);
 
     if (TensorShapeUtils::IsScalar(cond->shape())) {
       ComputeScalar(ctx, cond, then, else_);
@@ -149,12 +146,9 @@ class SelectV2Op : public OpKernel {
   explicit SelectV2Op(OpKernelConstruction* context) : OpKernel(context) {}
 
   void Compute(OpKernelContext* ctx) override {
-    const Tensor* cond;
-    const Tensor* then;
-    const Tensor* else_;
-    OP_REQUIRES_OK(ctx, ctx->input("condition", &cond));
-    OP_REQUIRES_OK(ctx, ctx->input("t", &then));
-    OP_REQUIRES_OK(ctx, ctx->input("e", &else_));
+    const Tensor* cond = &ctx->input(0);
+    const Tensor* then = &ctx->input(1);
+    const Tensor* else_ = &ctx->input(2);
 
     // The `cond`, `then`, and `else` are broadcastable (bcast.IsValid()),
     // This matches the behavior of numpy.
@@ -245,13 +239,21 @@ class SelectV2Op : public OpKernel {
       case 5:
         HANDLE_DIM(5);
         break;
+      case 6:
+        HANDLE_DIM(6);
+        break;
+      case 7:
+        HANDLE_DIM(7);
+        break;
+      case 8:
+        HANDLE_DIM(8);
+        break;
       default:
         ctx->SetStatus(errors::Unimplemented(
             "Broadcast between ", ctx->input(0).shape().DebugString(), " and ",
             ctx->input(1).shape().DebugString(), " is not supported yet."));
         break;
     }
-    return;
   }
 
  private:
@@ -346,8 +348,8 @@ struct SelectScalarHandler {
   }
 };
 
-// Specilization for CPU device. Forward input to output depending on the `cond`
-// value.
+// Specialization for CPU device. Forward input to output depending on the
+// `cond` value.
 // TODO(sjhwang): Consider specializing for GPUDevice as well by using
 // GPUDevice::memcpyDeviceToHost() to fetch bool value.
 template <typename T>

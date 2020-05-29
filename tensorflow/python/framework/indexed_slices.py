@@ -21,15 +21,17 @@ from __future__ import print_function
 
 import collections
 import warnings
+
 import numpy as np
 
+from tensorflow.python import tf2
 from tensorflow.python.eager import context
 from tensorflow.python.framework import composite_tensor
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import tensor_conversion_registry
-from tensorflow.python.framework import tensor_like
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import type_spec
+from tensorflow.python.types import internal
 from tensorflow.python.util.lazy_loader import LazyLoader
 from tensorflow.python.util.tf_export import tf_export
 
@@ -52,13 +54,10 @@ tensor_util = LazyLoader(
     "tensor_util", globals(),
     "tensorflow.python.framework.tensor_util")
 
-# pylint: disable=protected-access
-_TensorLike = tensor_like._TensorLike
-# pylint: enable=protected-access
 
-
+# TODO(mdan): Should IndexedSlices be a "tensor"?
 @tf_export("IndexedSlices")
-class IndexedSlices(_TensorLike, composite_tensor.CompositeTensor):
+class IndexedSlices(internal.NativeObject, composite_tensor.CompositeTensor):
   """A sparse representation of a set of tensor slices at given indices.
 
   This class is a simple wrapper for a pair of `Tensor` objects:
@@ -82,13 +81,12 @@ class IndexedSlices(_TensorLike, composite_tensor.CompositeTensor):
   (e.g. `tf.gather`).
 
   Contrast this representation with
-  `tf.SparseTensor`,
+  `tf.sparse.SparseTensor`,
   which uses multi-dimensional indices and scalar values.
   """
 
   def __init__(self, values, indices, dense_shape=None):
     """Creates an `IndexedSlices`."""
-    ops._get_graph_from_inputs([values, indices, dense_shape])  # pylint: disable=protected-access
     self._values = values
     self._indices = indices
     self._dense_shape = dense_shape
@@ -107,6 +105,18 @@ class IndexedSlices(_TensorLike, composite_tensor.CompositeTensor):
   def dense_shape(self):
     """A 1-D `Tensor` containing the shape of the corresponding dense tensor."""
     return self._dense_shape
+
+  @property
+  def shape(self):
+    """Gets the `tf.TensorShape` representing the shape of the dense tensor.
+
+    Returns:
+      A `tf.TensorShape` object.
+    """
+    if self._dense_shape is None:
+      return tensor_shape.TensorShape(None)
+
+    return tensor_util.constant_value_as_shape(self._dense_shape)
 
   @property
   def name(self):
@@ -188,7 +198,7 @@ class IndexedSlicesSpec(type_spec.TypeSpec):
   value_type = property(lambda self: IndexedSlices)
 
   def __init__(self, shape=None, dtype=dtypes.float32,
-               indices_dtype=dtypes.int64, dense_shape_dtype=True,
+               indices_dtype=dtypes.int64, dense_shape_dtype=None,
                indices_shape=None):
     """Constructs a type specification for a `tf.IndexedSlices`.
 
@@ -211,7 +221,7 @@ class IndexedSlicesSpec(type_spec.TypeSpec):
       self._dense_shape_dtype = None
     else:
       self._dense_shape_dtype = dtypes.as_dtype(dense_shape_dtype)
-    self._indices_shape = tensor_shape.as_shape(indices_shape)
+    self._indices_shape = tensor_shape.as_shape(indices_shape).with_rank(1)
 
   def _serialize(self):
     return (self._shape, self._values_dtype, self._indices_dtype,
@@ -226,7 +236,7 @@ class IndexedSlicesSpec(type_spec.TypeSpec):
     if self._dense_shape_dtype is not None:
       specs.append(
           tensor_spec.TensorSpec([self._shape.ndims], self._dense_shape_dtype))
-    return specs
+    return tuple(specs)
 
   def _to_components(self, value):
     if value.dense_shape is None:
@@ -235,7 +245,14 @@ class IndexedSlicesSpec(type_spec.TypeSpec):
       return (value.values, value.indices, value.dense_shape)
 
   def _from_components(self, tensor_list):
-    return IndexedSlices(*tensor_list)
+    if (all(isinstance(t, np.ndarray) for t in tensor_list) and
+        not tf2.enabled()):
+      if len(tensor_list) == 2:
+        return IndexedSlicesValue(tensor_list[0], tensor_list[1], None)
+      else:
+        return IndexedSlicesValue(*tensor_list)
+    else:
+      return IndexedSlices(*tensor_list)
 
 
 @tf_export(v1=["convert_to_tensor_or_indexed_slices"])
@@ -288,17 +305,16 @@ def internal_convert_to_tensor_or_indexed_slices(value,
     ValueError: If `dtype` does not match the element type of `value`.
   """
   if isinstance(value, ops.EagerTensor) and not context.executing_eagerly():
-    return ops.internal_convert_to_tensor(
-        value, dtype=dtype, name=name, as_ref=as_ref)
-  elif isinstance(value, _TensorLike):
+    return ops.convert_to_tensor(value, dtype=dtype, name=name, as_ref=as_ref)
+  # TODO(mdan): Name says tensor_or_indexed_slices. So do explicitly just that?
+  elif isinstance(value, internal.NativeObject):
     if dtype and not dtypes.as_dtype(dtype).is_compatible_with(value.dtype):
       raise ValueError(
           "Tensor conversion requested dtype %s for Tensor with dtype %s: %r" %
           (dtypes.as_dtype(dtype).name, value.dtype.name, str(value)))
     return value
   else:
-    return ops.internal_convert_to_tensor(
-        value, dtype=dtype, name=name, as_ref=as_ref)
+    return ops.convert_to_tensor(value, dtype=dtype, name=name, as_ref=as_ref)
 
 
 def internal_convert_n_to_tensor_or_indexed_slices(values,

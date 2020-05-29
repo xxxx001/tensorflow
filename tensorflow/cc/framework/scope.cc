@@ -272,7 +272,7 @@ std::unordered_set<string> Scope::Impl::GetColocationConstraints(
   std::unordered_set<string> current_constraints(colocation_constraints_);
   const AttrSlice attrs = colocate_with_op.node()->attrs();
   std::vector<string> node_constraints;
-  if (GetNodeAttr(attrs, kColocationAttrName, &node_constraints).ok()) {
+  if (TryGetNodeAttr(attrs, kColocationAttrName, &node_constraints)) {
     for (const string& entry : node_constraints) {
       StringPiece s(entry);
       if (absl::ConsumePrefix(&s, kColocationGroupPrefix)) {
@@ -299,7 +299,7 @@ const std::vector<Operation>& Scope::control_deps() const {
   return impl()->control_deps_;
 }
 
-void Scope::UpdateStatus(const Status s) const {
+void Scope::UpdateStatus(const Status& s) const {
   impl()->status_->Update(s);
   if (impl()->exit_on_error_ && !ok()) {
     LOG(FATAL) << *impl()->status_;
@@ -318,7 +318,7 @@ Status Scope::ToGraph(Graph* g, GraphConstructorOptions opts) const {
   if (ok()) {
     GraphDef graph_def;
     graph()->ToGraphDef(&graph_def);
-    UpdateStatus(ConvertGraphDefToGraph(opts, graph_def, g));
+    UpdateStatus(ConvertGraphDefToGraph(opts, std::move(graph_def), g));
   }
   return *impl()->status_;
 }
@@ -537,7 +537,7 @@ Status CreateOutputWithScope(string op_name,
   TF_RETURN_IF_ERROR(scope.status());
   const auto unique_name = scope.GetUniqueNameForOp(op_name);
   auto builder = ::tensorflow::NodeBuilder(unique_name, op_name);
-  for (auto input : inputs) {
+  for (const auto& input : inputs) {
     TF_RETURN_IF_ERROR(scope.status());
     builder = builder.Input(input.node());
   }

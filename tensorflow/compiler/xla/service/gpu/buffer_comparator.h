@@ -29,8 +29,7 @@ class BufferComparator {
   BufferComparator(const BufferComparator&) = delete;
   BufferComparator(BufferComparator&&) = default;
 
-  BufferComparator(const Shape& shape, const HloModuleConfig& config)
-      : shape_(shape), config_(config) {}
+  BufferComparator(const Shape& shape, const HloModuleConfig& config);
 
   // Returns true if the two buffers compare equal. The definition of "equal"
   // is:
@@ -41,9 +40,8 @@ class BufferComparator {
   //     abs(a - b) / (max(abs(a), abs(b)) + 1) < tolerance
   //
   // See the implementation for the tolerance value.
-  StatusOr<bool> CompareEqual(se::Stream* stream,
-                              se::DeviceMemoryBase lhs,
-                              se::DeviceMemoryBase rhs);
+  StatusOr<bool> CompareEqual(se::Stream* stream, se::DeviceMemoryBase lhs,
+                              se::DeviceMemoryBase rhs) const;
 
  private:
   Shape shape_;

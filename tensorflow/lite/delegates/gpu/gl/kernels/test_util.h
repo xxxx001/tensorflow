@@ -41,17 +41,17 @@ class SingleOpModel {
  public:
   SingleOpModel() = delete;
   SingleOpModel(Operation&& operation,
-                const std::vector<TensorRefFloat32>& inputs,
-                const std::vector<TensorRefFloat32>& outputs);
+                const std::vector<TensorRef<BHWC>>& inputs,
+                const std::vector<TensorRef<BHWC>>& outputs);
 
   virtual ~SingleOpModel() = default;
 
   bool PopulateTensor(int index, std::vector<float>&& data);
 
-  Status Invoke(const NodeShader& shader);
-  Status Invoke(const CompilationOptions& compile_options,
-                const RuntimeOptions& runtime_options,
-                const NodeShader& shader);
+  absl::Status Invoke(const NodeShader& shader);
+  absl::Status Invoke(const CompilationOptions& compile_options,
+                      const RuntimeOptions& runtime_options,
+                      const NodeShader& shader);
 
   const std::vector<float>& GetOutput(int index) const {
     return outputs_[index].data;

@@ -22,14 +22,13 @@ limitations under the License.
 #include "tensorflow/core/framework/allocator_registry.h"
 #include "tensorflow/core/framework/device_base.h"
 #include "tensorflow/core/framework/op_kernel.h"
-#include "tensorflow/core/framework/tensor.pb_text.h"
+#include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/framework/tensor_util.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/graph/types.h"
 #include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/platform/tracing.h"
 #include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/util/util.h"
 
@@ -51,7 +50,7 @@ ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
                                name, DEVICE_CPU, memory_limit, locality)),
       allocator_(allocator),
       scoped_allocator_mgr_(new ScopedAllocatorMgr(name)) {
-#ifdef INTEL_MKL
+#if !defined(ENABLE_MKLDNN_THREADPOOL) && defined(INTEL_MKL)
   // Early return when MKL is disabled
   if (DisableMKL()) return;
 #ifdef _OPENMP
@@ -70,7 +69,7 @@ ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
     }
   }
 #endif  // _OPENMP
-#endif  // INTEL_MKL
+#endif  // !defined(ENABLE_MKLDNN_THREADPOOL) && defined(INTEL_MKL)
 }
 
 ThreadPoolDevice::~ThreadPoolDevice() {}
@@ -101,7 +100,7 @@ Status ThreadPoolDevice::MakeTensorFromProto(
     }
   }
   return errors::InvalidArgument("Cannot parse tensor from proto: ",
-                                 ProtoDebugString(tensor_proto));
+                                 tensor_proto.DebugString());
 }
 
 void ThreadPoolDevice::CopyTensorInSameDevice(
@@ -115,40 +114,6 @@ void ThreadPoolDevice::CopyTensorInSameDevice(
   }
   tensor::DeepCopy(*input_tensor, output_tensor);
   done(Status::OK());
-}
-
-void ThreadPoolDevice::Compute(OpKernel* op_kernel, OpKernelContext* context) {
-  profiler::TraceMe activity(
-      [&] {
-        return absl::StrCat("ThreadPoolDevice::Compute ", op_kernel->name(),
-                            ":", op_kernel->type_string(),
-                            "#step_id=", context->step_id(),
-                            ",step_container_name=",
-                            context->step_container() == nullptr
-                                ? "n/a"
-                                : context->step_container()->name(),
-                            "#");
-      },
-      profiler::GetTFTraceMeLevel(op_kernel->IsExpensive()));
-  op_kernel->Compute(context);
-}
-
-void ThreadPoolDevice::ComputeAsync(AsyncOpKernel* op_kernel,
-                                    OpKernelContext* context,
-                                    AsyncOpKernel::DoneCallback done) {
-  profiler::TraceMe activity(
-      [&] {
-        return absl::StrCat("ThreadPoolDevice::ComputeAsync ",
-                            op_kernel->name(), ":", op_kernel->type_string(),
-                            "#step_id=", context->step_id(),
-                            ",step_container_name=",
-                            context->step_container() == nullptr
-                                ? "n/a"
-                                : context->step_container()->name(),
-                            "#");
-      },
-      profiler::GetTFTraceMeLevel(op_kernel->IsExpensive()));
-  op_kernel->ComputeAsync(context, done);
 }
 
 #ifdef INTEL_MKL

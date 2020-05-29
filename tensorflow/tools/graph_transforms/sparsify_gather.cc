@@ -18,8 +18,8 @@ limitations under the License.
 #include <unordered_map>
 
 #include "tensorflow/c/checkpoint_reader.h"
+#include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/graph/subgraph.h"
 #include "tensorflow/core/lib/strings/str_util.h"
@@ -126,7 +126,7 @@ Status ObtainTensorSlice(const GraphDef& input_graph_def,
     if (node.name() == tensor_names_node) {
       Tensor tensor_names_tensor;
       TF_RETURN_IF_ERROR(GetNodeAttr(node, "value", &tensor_names_tensor));
-      const auto& tensor_names_value = tensor_names_tensor.flat<string>();
+      const auto& tensor_names_value = tensor_names_tensor.flat<tstring>();
       for (int i = 0; i < tensor_names_value.size(); i++) {
         if (tensor_names_value(i) == GetMonolithicTensorKey(target_name)) {
           offset = i;
@@ -144,7 +144,7 @@ Status ObtainTensorSlice(const GraphDef& input_graph_def,
       Tensor shape_and_slices_tensor;
       TF_RETURN_IF_ERROR(GetNodeAttr(node, "value", &shape_and_slices_tensor));
       const auto& shape_and_slices_value =
-          shape_and_slices_tensor.flat<string>();
+          shape_and_slices_tensor.flat<tstring>();
       *shape_slice_string = shape_and_slices_value(offset);
       return Status::OK();
     }
@@ -478,7 +478,7 @@ Status SparsifyGatherInternal(
     }
 
     // Add nodes with a reference count of 0 for deletion.
-    for (auto entry : refs) {
+    for (const auto& entry : refs) {
       if (entry.second == 0) {
         removed_node_names.push_back(entry.first);
       }

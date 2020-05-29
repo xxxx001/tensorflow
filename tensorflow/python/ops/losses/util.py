@@ -27,7 +27,6 @@ from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import confusion_matrix
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import weights_broadcast_ops
 from tensorflow.python.util import tf_contextlib
 from tensorflow.python.util.tf_export import tf_export
 
@@ -143,9 +142,6 @@ def scale_losses_by_sample_weight(losses, sample_weight):
   # Update dimensions of `sample_weight` to match with `losses` if possible.
   losses, _, sample_weight = squeeze_or_expand_dimensions(
       losses, None, sample_weight)
-
-  # Broadcast weights if possible.
-  sample_weight = weights_broadcast_ops.broadcast_weights(sample_weight, losses)
   return math_ops.multiply(losses, sample_weight)
 
 
@@ -240,7 +236,9 @@ def get_regularization_loss(scope=None, name="total_regularization_loss"):
 
 
 @tf_export(v1=["losses.get_total_loss"])
-def get_total_loss(add_regularization_losses=True, name="total_loss"):
+def get_total_loss(add_regularization_losses=True,
+                   name="total_loss",
+                   scope=None):
   """Returns a tensor whose value represents the total loss.
 
   In particular, this adds any losses you have added with `tf.add_loss()` to
@@ -253,6 +251,9 @@ def get_total_loss(add_regularization_losses=True, name="total_loss"):
     add_regularization_losses: A boolean indicating whether or not to use the
       regularization losses in the sum.
     name: The name of the returned tensor.
+    scope: An optional scope name for filtering the losses to return. Note that
+      this filters the losses added with `tf.add_loss()` as well as the
+      regularization losses to that scope.
 
   Returns:
     A `Tensor` whose value represents the total loss.
@@ -260,7 +261,7 @@ def get_total_loss(add_regularization_losses=True, name="total_loss"):
   Raises:
     ValueError: if `losses` is not iterable.
   """
-  losses = get_losses()
+  losses = get_losses(scope=scope)
   if add_regularization_losses:
-    losses += get_regularization_losses()
+    losses += get_regularization_losses(scope=scope)
   return math_ops.add_n(losses, name=name)

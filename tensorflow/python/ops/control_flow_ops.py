@@ -14,7 +14,7 @@
 # ==============================================================================
 """Control Flow Operations.
 
-See the [autograph](https://www.tensorflow.org/guide/autographs) guide.
+See the [autograph](https://www.tensorflow.org/guide/autograph) guide.
 """
 # pylint: disable=g-bad-name
 from __future__ import absolute_import
@@ -43,7 +43,9 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_util as util
 from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import gen_control_flow_ops
+from tensorflow.python.ops import gen_functional_ops
 from tensorflow.python.ops import gen_logging_ops
+from tensorflow.python.ops import gen_math_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import tensor_array_ops
 # go/tf-wildcard-import
@@ -53,6 +55,7 @@ from tensorflow.python.ops.gen_control_flow_ops import *
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import compat
 from tensorflow.python.util import deprecation
+from tensorflow.python.util import dispatch
 from tensorflow.python.util import nest
 from tensorflow.python.util import tf_should_use
 from tensorflow.python.util.lazy_loader import LazyLoader
@@ -86,6 +89,7 @@ def _summarize_eager(tensor, summarize=None):
     summarize = 3
   elif summarize < 0:
     summarize = array_ops.size(tensor)
+
   # reshape((-1,)) is the fastest way to get a flat array view
   if tensor._rank():  # pylint: disable=protected-access
     flat = tensor.numpy().reshape((-1,))
@@ -94,7 +98,7 @@ def _summarize_eager(tensor, summarize=None):
       lst.append("...")
   else:
     # tensor.numpy() returns a scalar for zero dimensional arrays
-    if summarize != 0:
+    if gen_math_ops.not_equal(summarize, 0):
       lst = [str(tensor.numpy())]
     else:
       lst = []
@@ -108,22 +112,13 @@ def _summarize_eager(tensor, summarize=None):
 # Assert and Print are special symbols in python, so we must
 # use an upper-case version of them.
 @tf_export("debugging.Assert", "Assert")
+@dispatch.add_dispatch_support
 @tf_should_use.should_use_result
 def Assert(condition, data, summarize=None, name=None):
   """Asserts that the given condition is true.
 
   If `condition` evaluates to false, print the list of tensors in `data`.
   `summarize` determines how many entries of the tensors to print.
-
-  NOTE: In graph mode, to ensure that Assert executes, one usually attaches
-  a dependency:
-
-  ```python
-  # Ensure maximum element of x is smaller or equal to 1
-  assert_op = tf.Assert(tf.less_equal(tf.reduce_max(x), 1.), [x])
-  with tf.control_dependencies([assert_op]):
-    ... code using x ...
-  ```
 
   Args:
     condition: The condition to evaluate.
@@ -139,8 +134,17 @@ def Assert(condition, data, summarize=None, name=None):
     @end_compatibility
 
   Raises:
-    @compatibility(eager)
-    `tf.errors.InvalidArgumentError` if `condition` is not true
+    @compatibility(TF1)
+    When in TF V1 mode (that is, outside `tf.function`) Assert needs a control
+    dependency on the output to ensure the assertion executes:
+
+  ```python
+  # Ensure maximum element of x is smaller or equal to 1
+  assert_op = tf.Assert(tf.less_equal(tf.reduce_max(x), 1.), [x])
+  with tf.control_dependencies([assert_op]):
+    ... code using x ...
+  ```
+
     @end_compatibility
   """
   if context.executing_eagerly():
@@ -432,27 +436,13 @@ def _convert_tensorarray_to_flow(tensor_or_tensor_array):
     return tensor_or_tensor_array
 
 
-def _make_tensor_array(ta, t_or_flow):
-  # pylint: disable=protected-access
-  new_ta = tensor_array_ops.TensorArray(
-      dtype=ta.dtype,
-      handle=ta.handle,
-      flow=t_or_flow,
-      infer_shape=ta._infer_shape,
-      colocate_with_first_write_call=ta._colocate_with_first_write_call)
-  new_ta._colocate_with = ta._colocate_with
-  new_ta._element_shape = ta._element_shape
-  # pylint: enable=protected-access
-  return new_ta
-
-
 def _convert_flows_to_tensorarrays(tensors_or_tensorarrays, tensors_or_flows):
   if len(tensors_or_tensorarrays) != len(tensors_or_flows):
     raise ValueError(
         "Lengths of original Tensor list and new list do not match: %d vs. %d" %
         (len(tensors_or_tensorarrays), len(tensors_or_flows)))
   return [
-      _make_tensor_array(ta, t_or_flow) if isinstance(
+      tensor_array_ops.build_ta_with_new_flow(ta, t_or_flow) if isinstance(
           ta, tensor_array_ops.TensorArray) else t_or_flow
       for (ta, t_or_flow) in zip(tensors_or_tensorarrays, tensors_or_flows)
   ]
@@ -494,6 +484,12 @@ def _get_shape_invariant(var, shape=None):
 
   elif shape is None:
     return var.shape
+  elif isinstance(shape, tensor_spec.TensorSpec):
+    if var.dtype != shape.dtype:
+      raise TypeError("TensorSpec %r is not compatible with %r" % (shape, var))
+    return shape.shape
+  elif isinstance(shape, type_spec.TypeSpec):
+    raise TypeError("TypeSpec %r is not compatible with %r" % (shape, var))
   else:
     return shape
 
@@ -509,11 +505,16 @@ def _shape_invariant_to_type_spec(var, shape):
   Returns:
     A `TypeSpec` for `var`, consistent with the given shape.
   """
-  if isinstance(shape, type_spec.TypeSpec):
+  if shape is None:
+    return type_spec.type_spec_from_value(var)
+  elif isinstance(shape, type_spec.TypeSpec):
+    if not shape.is_compatible_with(var):
+      raise TypeError("TypeSpec %r is not compatible with %r" % (shape, var))
     return shape
   elif not isinstance(shape, tensor_shape.TensorShape):
-    raise TypeError("Expected shape to be a TypeSpec or TensorShape, got %r"
-                    % shape)
+    raise TypeError(
+        "Expected shape to be a TypeSpec, TensorShape or None, got %r for"
+        " value %r" % (shape, var))
 
   if isinstance(var, ops.Tensor):
     return tensor_spec.TensorSpec(shape, var.dtype)
@@ -574,7 +575,7 @@ def _EnforceShapeInvariant(merge_var, next_var):
 
   Raises:
     ValueError: If any tensor in `merge_var` has a more specific shape than
-      its correspnding tensor in `next_var`.
+      its corresponding tensor in `next_var`.
   """
   if isinstance(merge_var, ops.Tensor):
     m_shape = merge_var.get_shape()
@@ -753,25 +754,16 @@ class ControlFlowContext(object):
   def ExitResult(self, result):
     """Make a list of tensors available in the outer context."""
     if self._outer_context:
-      nest.map_structure(
-          lambda x: self._outer_context.AddName(x.name),
-          result,
-          expand_composites=True)
+      def fn(x):
+        self._outer_context.AddName(x.name)
+        return x
+      nest.map_structure(fn, result, expand_composites=True)
 
   def GetWhileContext(self):
     """Return the while context containing this context."""
     if self._outer_context:
       return self._outer_context.GetWhileContext()
     return None
-
-  def _IsInOuterContext(self, op):
-    op_ctxt = util.GetOutputContext(op)
-    outer_ctxt = self.outer_context
-    while outer_ctxt != op_ctxt:
-      if outer_ctxt is None:
-        return False
-      outer_ctxt = outer_ctxt.outer_context
-    return True
 
   def _RemoveExternalControlEdges(self, op):
     """Remove any external control dependency on this op."""
@@ -1080,7 +1072,7 @@ class CondContext(ControlFlowContext):
       with ops.control_dependencies(new_summaries):
         if original_result is None:
           return no_op(), None
-        else:
+        elif not isinstance(original_result, ops.Operation):
           original_result = nest.map_structure(
               array_ops.identity, original_result, expand_composites=True)
     if original_result is None:
@@ -1106,6 +1098,7 @@ def _UnpackIfSingleton(res):
 # pylint: disable=redefined-outer-name
 # pylint: disable=g-doc-args
 @tf_export(v1=["cond"])
+@dispatch.add_dispatch_support
 @deprecation.deprecated_args(
     None, "fn1/fn2 are deprecated in favor of the true_fn/false_fn arguments.",
     "fn1", "fn2")
@@ -1329,6 +1322,7 @@ def _cast_indexed_slice_indices(a, b):
 
 
 @tf_export("cond", v1=[])
+@dispatch.add_dispatch_support
 def cond_for_tf_v2(pred, true_fn=None, false_fn=None, name=None):
   """Return `true_fn()` if the predicate `pred` is true else `false_fn()`.
 
@@ -1734,6 +1728,10 @@ class WhileContext(ControlFlowContext):
     We move any external control dependencies of the op to the loop pivot, to
     ensure they get executed.
     """
+    # This is needed to prevent frame mismatch errors where there are Const
+    # nodes inside tf.function in v1 while_loop and inlining is turned on.
+    if op.type in ["PartitionedCall", "StatefulPartitionedCall"]:
+      op._add_control_input(self.GetControlPivot().op)  # pylint: disable=protected-access
     if not op.inputs:
       # Remove any external control dependency on this op
       control_inputs, external_inputs = self._RemoveExternalControlEdges(op)
@@ -2285,9 +2283,22 @@ class WhileContext(ControlFlowContext):
       for x in xs:
         inp_op = x.op.inputs[0].op
         control_inputs = graph._control_dependencies_for_inputs([inp_op])
-        outer_control_inputs = [
-            op for op in control_inputs if self._IsInOuterContext(op)
-        ]
+        outer_control_inputs = []
+        for op in control_inputs:
+          # We need to keep control inputs that are in any ancestor
+          # ControlFlowContext, and within outer WhileContext.
+          keep_as_control_input = True
+          op_ctxt = util.GetOutputContext(op)
+          outer_ctxt = self.outer_context
+          outer_while_context = (None if outer_ctxt is None else
+                                 outer_ctxt.GetWhileContext())
+          while outer_ctxt != op_ctxt:
+            if outer_ctxt is None or outer_ctxt == outer_while_context:
+              keep_as_control_input = False
+              break
+            outer_ctxt = outer_ctxt.outer_context
+          if keep_as_control_input:
+            outer_control_inputs.append(op)
         x.op._set_control_flow_context(self)
         x.op._add_control_inputs(outer_control_inputs)
         graph._record_op_seen_by_control_dependencies(x.op)
@@ -2300,6 +2311,15 @@ class WhileContext(ControlFlowContext):
 # @TODO(b/133606651) Replace "shape_invariants" with "loop_vars_signature".
 # pylint: disable=redefined-outer-name
 @tf_export("while_loop", v1=[])
+@deprecation.deprecated_arg_values(
+    None,
+    """back_prop=False is deprecated. Consider using tf.stop_gradient instead.
+Instead of:
+results = tf.while_loop(c, b, vars, back_prop=False)
+Use:
+results = tf.nest.map_structure(tf.stop_gradient, tf.while_loop(c, b, vars))""",
+    warn_once=True,
+    back_prop=False)
 def while_loop_v2(cond,
                   body,
                   loop_vars,
@@ -2377,7 +2397,8 @@ def while_loop_v2(cond,
     shape_invariants: The shape invariants for the loop variables.
     parallel_iterations: The number of iterations allowed to run in parallel. It
       must be a positive integer.
-    back_prop: Whether backprop is enabled for this while loop.
+    back_prop: (optional) Deprecated. False disables support for back
+      propagation. Prefer using `tf.stop_gradient` instead.
     swap_memory: Whether GPU-CPU memory swap is enabled for this loop.
     maximum_iterations: Optional maximum number of iterations of the while loop
       to run.  If provided, the `cond` output is AND-ed with an additional
@@ -2398,7 +2419,7 @@ def while_loop_v2(cond,
   ```python
   i = tf.constant(0)
   c = lambda i: tf.less(i, 10)
-  b = lambda i: tf.add(i, 1)
+  b = lambda i: (tf.add(i, 1), )
   r = tf.while_loop(c, b, [i])
   ```
 
@@ -2652,6 +2673,13 @@ def while_loop(cond,
   ```
 
   """
+  if not callable(cond):
+    raise TypeError("cond must be callable.")
+  if not callable(body):
+    raise TypeError("body must be callable.")
+  if parallel_iterations < 1:
+    raise TypeError("parallel_iterations must be a positive integer.")
+
   # Always enable control flow v2 if building a function, regardless of toggle.
   executing_eagerly = context.executing_eagerly()
   if (util.EnableControlFlowV2(ops.get_default_graph()) and
@@ -2664,18 +2692,13 @@ def while_loop(cond,
         parallel_iterations=parallel_iterations,
         maximum_iterations=maximum_iterations,
         name=name,
-        return_same_structure=return_same_structure)
+        return_same_structure=return_same_structure,
+        back_prop=back_prop)
 
   with ops.name_scope(name, "while", loop_vars):
     if not loop_vars:
       raise ValueError("No loop variables provided")
-    if not callable(cond):
-      raise TypeError("cond must be callable.")
-    if not callable(body):
-      raise TypeError("body must be callable.")
-    if parallel_iterations < 1:
-      raise TypeError("parallel_iterations must be a positive integer.")
-
+    try_to_pack = (len(loop_vars) == 1 and not return_same_structure)
     if maximum_iterations is not None:
       maximum_iterations = ops.convert_to_tensor(
           maximum_iterations, name="maximum_iterations")
@@ -2691,7 +2714,7 @@ def while_loop(cond,
             0, dtype=maximum_iterations.dtype, name="iteration_counter")
       orig_cond = cond
       orig_body = body
-      if len(loop_vars) == 1:
+      if try_to_pack:
         loop_vars = (counter, loop_vars[0])
         cond = lambda i, lv: (  # pylint: disable=g-long-lambda
             math_ops.logical_and(i < maximum_iterations, orig_cond(lv)))
@@ -2701,9 +2724,9 @@ def while_loop(cond,
         cond = lambda i, lv: (  # pylint: disable=g-long-lambda
             math_ops.logical_and(i < maximum_iterations, orig_cond(*lv)))
         body = lambda i, lv: (i + 1, orig_body(*lv))
+      try_to_pack = False
 
     if executing_eagerly:
-      try_to_pack = len(loop_vars) == 1
       packed = False  # whether the body result was packed into a 1-item tuple
 
       loop_var_structure = nest.map_structure(type_spec.type_spec_from_value,
@@ -2852,6 +2875,23 @@ def group(*inputs, **kwargs):
   When this op finishes, all ops in `inputs` have finished. This op has no
   output.
 
+  Note: *In TensorFlow 2 with eager and/or Autograph, you should not require
+  this method, as code executes in your expected order.* Only use tf.group when
+  working with v1-style code or in a graph context such as inside `Dataset.map`.
+
+  When operating in a v1-style graph context, ops are not executed in the same
+  order as specified in the code; TensorFlow will attempt to execute ops in
+  parallel or in an order convienient to the result it is computing.  `tf.group`
+  allows you to request that one or more results finish before execution
+  continues.
+
+  `tf.group` creates a single op (of type `NoOp`), and then adds appropriate
+  control dependencies.  Thus, `c = tf.group(a, b)` will compute the same graph
+  as this:
+
+      with tf.control_dependencies([a, b]):
+          c = tf.no_op()
+
   See also `tf.tuple` and
   `tf.control_dependencies`.
 
@@ -2907,6 +2947,7 @@ def group(*inputs, **kwargs):
 
 
 @tf_export("tuple", v1=[])
+@dispatch.add_dispatch_support
 def tuple_v2(tensors, control_inputs=None, name=None):
   """Group tensors together.
 
@@ -2943,6 +2984,7 @@ def tuple_v2(tensors, control_inputs=None, name=None):
 
 
 @tf_export(v1=["tuple"])
+@dispatch.add_dispatch_support
 def tuple(tensors, name=None, control_inputs=None):  # pylint: disable=redefined-builtin
   """Group tensors together.
 
@@ -3242,7 +3284,11 @@ def _indexed_case_verify_and_canonicalize_args(branch_fns, default,
   return actions
 
 
-def _indexed_case_helper(branch_fns, default, branch_index, name):
+def _indexed_case_helper(branch_fns,
+                         default,
+                         branch_index,
+                         name,
+                         lower_using_switch_merge=None):
   """Implementation of case that emits the n-way indexed Case op.
 
   Args:
@@ -3252,6 +3298,7 @@ def _indexed_case_helper(branch_fns, default, branch_index, name):
     branch_index: Optional int `Tensor`, which selects for the corresponding
       pred_fn_pair.
     name: A name for this operation (optional).
+    lower_using_switch_merge: Lower this op using switch merge ops (optional).
 
   Returns:
     The tensors returned by the pair whose key matched branch_index, or
@@ -3267,16 +3314,125 @@ def _indexed_case_helper(branch_fns, default, branch_index, name):
   branch_fns = _indexed_case_verify_and_canonicalize_args(
       branch_fns, default, branch_index)
   with ops.name_scope(name, "case", [branch_index]):
-    if context.executing_eagerly():
+    if context.executing_eagerly() and not hasattr(branch_index, "graph"):
       branch_index = array_ops.where(
           math_ops.less(branch_index, 0)
           | math_ops.greater_equal(branch_index, len(branch_fns)),
           len(branch_fns) - 1, branch_index)
       return branch_fns[int(branch_index)]()
-    return cond_v2.indexed_case(branch_index, branch_fns)
+    return cond_v2.indexed_case(
+        branch_index,
+        branch_fns,
+        lower_using_switch_merge=lower_using_switch_merge)
 
 
-@tf_export("case")
+@tf_export("case", v1=[])
+@dispatch.add_dispatch_support
+def case_v2(pred_fn_pairs,
+            default=None,
+            exclusive=False,
+            strict=False,
+            name="case"):
+  """Create a case operation.
+
+  See also `tf.switch_case`.
+
+  The `pred_fn_pairs` parameter is a list of pairs of size N.
+  Each pair contains a boolean scalar tensor and a python callable that
+  creates the tensors to be returned if the boolean evaluates to True.
+  `default` is a callable generating a list of tensors. All the callables
+  in `pred_fn_pairs` as well as `default` (if provided) should return the same
+  number and types of tensors.
+
+  If `exclusive==True`, all predicates are evaluated, and an exception is
+  thrown if more than one of the predicates evaluates to `True`.
+  If `exclusive==False`, execution stops at the first predicate which
+  evaluates to True, and the tensors generated by the corresponding function
+  are returned immediately. If none of the predicates evaluate to True, this
+  operation returns the tensors generated by `default`.
+
+  `tf.case` supports nested structures as implemented in
+  `tf.contrib.framework.nest`. All of the callables must return the same
+  (possibly nested) value structure of lists, tuples, and/or named tuples.
+  Singleton lists and tuples form the only exceptions to this: when returned by
+  a callable, they are implicitly unpacked to single values. This
+  behavior is disabled by passing `strict=True`.
+
+  @compatibility(v2)
+  `pred_fn_pairs` could be a dictionary in v1. However, tf.Tensor and
+  tf.Variable are no longer hashable in v2, so cannot be used as a key for a
+  dictionary.  Please use a list or a tuple instead.
+  @end_compatibility
+
+
+  **Example 1:**
+
+  Pseudocode:
+
+  ```
+  if (x < y) return 17;
+  else return 23;
+  ```
+
+  Expressions:
+
+  ```python
+  f1 = lambda: tf.constant(17)
+  f2 = lambda: tf.constant(23)
+  r = tf.case([(tf.less(x, y), f1)], default=f2)
+  ```
+
+  **Example 2:**
+
+  Pseudocode:
+
+  ```
+  if (x < y && x > z) raise OpError("Only one predicate may evaluate to True");
+  if (x < y) return 17;
+  else if (x > z) return 23;
+  else return -1;
+  ```
+
+  Expressions:
+
+  ```python
+  def f1(): return tf.constant(17)
+  def f2(): return tf.constant(23)
+  def f3(): return tf.constant(-1)
+  r = tf.case([(tf.less(x, y), f1), (tf.greater(x, z), f2)],
+           default=f3, exclusive=True)
+  ```
+
+  Args:
+    pred_fn_pairs: List of pairs of a boolean scalar tensor and a callable which
+      returns a list of tensors.
+    default: Optional callable that returns a list of tensors.
+    exclusive: True iff at most one predicate is allowed to evaluate to `True`.
+    strict: A boolean that enables/disables 'strict' mode; see above.
+    name: A name for this operation (optional).
+
+  Returns:
+    The tensors returned by the first pair whose predicate evaluated to True, or
+    those returned by `default` if none does.
+
+  Raises:
+    TypeError: If `pred_fn_pairs` is not a list/tuple.
+    TypeError: If `pred_fn_pairs` is a list but does not contain 2-tuples.
+    TypeError: If `fns[i]` is not callable for any i, or `default` is not
+               callable.
+  """
+  return _case_helper(
+      cond,
+      pred_fn_pairs,
+      default,
+      exclusive,
+      name,
+      allow_python_preds=False,
+      strict=strict)
+
+
+@tf_export(v1=["case"])
+@dispatch.add_dispatch_support
 def case(pred_fn_pairs,
          default=None,
          exclusive=False,
@@ -3398,7 +3554,7 @@ def switch_case(branch_index,
   statement than `tf.case`, which is more like an if/elif/elif/else chain.
 
   The `branch_fns` parameter is either a dict from `int` to callables, or list
-  of (`int, callable) pairs, or simply a list of callables (in which case the
+  of (`int`, callable) pairs, or simply a list of callables (in which case the
   index is implicitly the key). The `branch_index` `Tensor` is used to select an
   element in `branch_fns` with matching `int` key, falling back to `default`
   if none match, or `max(keys)` if no `default` is provided. The keys must form
@@ -3439,7 +3595,7 @@ def switch_case(branch_index,
     branch_index: An int Tensor specifying which of `branch_fns` should be
       executed.
     branch_fns: A `dict` mapping `int`s to callables, or a `list` of
-      (`int, callable) pairs, or simply a list of callables (in which case the
+      (`int`, callable) pairs, or simply a list of callables (in which case the
       index serves as the key). Each callable must return a matching structure
       of tensors.
     default: Optional callable that returns a structure of tensors.
@@ -3458,6 +3614,50 @@ def switch_case(branch_index,
                callable.
   """
   return _indexed_case_helper(branch_fns, default, branch_index, name)
+
+
+def execute_fn_for_device(device_branch_fns, default_fn, name="execute_fn"):
+  """Executes one of the provided callables based on the device placement.
+
+  This API is used when the implementations for high level function depend on
+  the underlying device placement. It takes a dictionary of device type to
+  callables. The device type includes "CPU", "GPU", "TPU", etc. When the type of
+  the device where to run this op matches the key in 'device_branch_fns',
+  the corresponding callable is executed, falling back to 'default_fn' if none
+  matches.
+
+  **Example:**
+  ```python
+  def f1(): return tf.constant(1)
+  def f2(): return tf.constant(2)
+  r = tf.execute_fn_for_device({"CPU": f1, "GPU": f2}, default_fn=f1)
+  ```
+  'r' is evaluated as 1 when it runs on CPU, 2 running on GPU, 1 running on
+  any other device types.
+
+
+  Args:
+    device_branch_fns: a dictionary of device types to the callables. Each
+      callable must return a matching structure of tensors.
+    default_fn: fallback callable when the underlying device does not match any
+      key in the 'device_branch_fns'.
+    name: A name for this operation (optional).
+
+  Returns:
+    The tensors returned by the callable identified by device type during
+    execution, or those returned by 'default_fn' if no key matches.
+  """
+
+  device_branch_fns_upper = {k.upper(): v for k, v in device_branch_fns.items()}
+  branch_fns = list(device_branch_fns_upper.values())
+  devices = list(device_branch_fns_upper.keys())
+  device_index = gen_functional_ops.device_index(device_names=devices)
+  return _indexed_case_helper(
+      branch_fns,
+      default_fn,
+      device_index,
+      name,
+      lower_using_switch_merge=False)
 
 
 class XLAControlFlowContext(ControlFlowContext):

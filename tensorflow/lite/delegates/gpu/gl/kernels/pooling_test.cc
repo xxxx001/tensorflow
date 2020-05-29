@@ -35,12 +35,12 @@ namespace gl {
 namespace {
 
 TEST(PoolingTest, MaxKernel2x2Stride2x2WithIndices) {
-  TensorRefFloat32 input;
+  TensorRef<BHWC> input;
   input.type = DataType::FLOAT32;
   input.ref = 0;
   input.shape = BHWC(1, 4, 4, 1);
 
-  TensorRefFloat32 output;
+  TensorRef<BHWC> output;
   output.type = DataType::FLOAT32;
   output.ref = 1;
   output.shape = BHWC(1, 2, 2, 1);
@@ -58,8 +58,8 @@ TEST(PoolingTest, MaxKernel2x2Stride2x2WithIndices) {
   attr.type = PoolingType::MAX;
   attr.output_indices = true;
 
-  SingleOpModel model({ToString(OperationType::MAX_UNPOOLING_2D), attr},
-                      {input}, {output, indices});
+  SingleOpModel model({ToString(OperationType::POOLING_2D), attr}, {input},
+                      {output, indices});
   ASSERT_TRUE(model.PopulateTensor(
       0, {1, 2, 1, 2, 3, 4, 3, 4, 7, 8, 7, 8, 5, 6, 5, 6}));
   ASSERT_OK(model.Invoke(*NewPoolingNodeShader()));
@@ -70,12 +70,12 @@ TEST(PoolingTest, MaxKernel2x2Stride2x2WithIndices) {
 }
 
 TEST(PoolingTest, MaxKernel2x2Stride2x2WithoutIndices) {
-  TensorRefFloat32 input;
+  TensorRef<BHWC> input;
   input.type = DataType::FLOAT32;
   input.ref = 0;
   input.shape = BHWC(1, 4, 4, 1);
 
-  TensorRefFloat32 output;
+  TensorRef<BHWC> output;
   output.type = DataType::FLOAT32;
   output.ref = 1;
   output.shape = BHWC(1, 2, 2, 1);
@@ -87,8 +87,8 @@ TEST(PoolingTest, MaxKernel2x2Stride2x2WithoutIndices) {
   attr.strides = HW(2, 2);
   attr.type = PoolingType::MAX;
 
-  SingleOpModel model({ToString(OperationType::MAX_UNPOOLING_2D), attr},
-                      {input}, {output});
+  SingleOpModel model({ToString(OperationType::POOLING_2D), attr}, {input},
+                      {output});
   ASSERT_TRUE(model.PopulateTensor(
       0, {1, 2, 1, 2, 3, 4, 3, 4, 7, 8, 7, 8, 5, 6, 5, 6}));
   ASSERT_OK(model.Invoke(*NewPoolingNodeShader()));
@@ -96,12 +96,12 @@ TEST(PoolingTest, MaxKernel2x2Stride2x2WithoutIndices) {
 }
 
 TEST(PoolingTest, AverageKernel2x2Stride2x2) {
-  TensorRefFloat32 input;
+  TensorRef<BHWC> input;
   input.type = DataType::FLOAT32;
   input.ref = 0;
   input.shape = BHWC(1, 4, 4, 1);
 
-  TensorRefFloat32 output;
+  TensorRef<BHWC> output;
   output.type = DataType::FLOAT32;
   output.ref = 1;
   output.shape = BHWC(1, 2, 2, 1);

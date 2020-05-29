@@ -20,7 +20,7 @@ from __future__ import print_function
 
 import numpy as np
 
-from tensorflow.compiler.tf2tensorrt.wrap_py_utils import get_linked_tensorrt_version
+from tensorflow.compiler.tf2tensorrt._pywrap_py_utils import get_linked_tensorrt_version
 from tensorflow.python.compiler.tensorrt.test import tf_trt_integration_test_base as trt_test
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
@@ -64,21 +64,19 @@ class QuantizationMissingAllRangesTest(trt_test.TfTrtIntegrationTestBase):
     return _GetParams(self)
 
   def ShouldRunTest(self, run_params):
-    if get_linked_tensorrt_version()[0] < 5:
-      return False
     # Only test static engine mode, with or without calibration.
-    return (trt_test.IsQuantizationMode(run_params.precision_mode) and
-            not run_params.convert_online and not run_params.dynamic_engine)
+    return (get_linked_tensorrt_version()[0] >= 5 and
+            trt_test.IsQuantizationMode(run_params.precision_mode) and
+            not run_params.convert_online and not run_params.dynamic_engine
+           ), "test static engine, offline conversion and INT8"
 
   def ExpectedEnginesToBuild(self, run_params):
     """Return the expected engines to build."""
-    if run_params.use_calibration:
-      # In static engine mode with calibration, it should build a calibration
-      # engine.
-      return ["TRTEngineOp_0"]
-    # In static engine mode without calibration, the engine building will fail
-    # since no quantization ranges are set, which results in no TRT nodes.
-    return []
+    # In static engine mode with calibration, it should build a calibration
+    # engine.
+    # In static engine mode without calibration, the engine building will
+    # succeed but fall back to non-quantized ops.
+    return ["TRTEngineOp_0"]
 
 
 class QuantizationWithRangesTest(trt_test.TfTrtIntegrationTestBase):
@@ -91,11 +89,10 @@ class QuantizationWithRangesTest(trt_test.TfTrtIntegrationTestBase):
     return _GetParams(self)
 
   def ShouldRunTest(self, run_params):
-    if get_linked_tensorrt_version()[0] < 5:
-      return False
     # Test static/dynamic engine with/without calibration.
-    return (trt_test.IsQuantizationMode(run_params.precision_mode) and
-            not run_params.convert_online)
+    return (get_linked_tensorrt_version()[0] >= 5 and
+            trt_test.IsQuantizationMode(run_params.precision_mode) and
+            not run_params.convert_online), "test offline conversion and INT8"
 
   def ExpectedEnginesToBuild(self, run_params):
     """Return the expected engines to build."""
@@ -121,7 +118,8 @@ class NonQuantizedPrecisionsWithRangesTest(trt_test.TfTrtIntegrationTestBase):
 
   def ShouldRunTest(self, run_params):
     # Only test FP32/FP16 mode.
-    return not trt_test.IsQuantizationMode(run_params.precision_mode)
+    return not trt_test.IsQuantizationMode(
+        run_params.precision_mode), "test non-INT8"
 
   def ExpectedEnginesToBuild(self, run_params):
     """Return the expected engines to build."""

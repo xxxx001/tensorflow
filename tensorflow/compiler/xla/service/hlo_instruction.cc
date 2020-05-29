@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/literal.h"
@@ -46,6 +47,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/util.h"
+#include "tensorflow/compiler/xla/xla_data.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/platform/human_readable_json.h"
@@ -62,7 +64,8 @@ using absl::StrJoin;
 StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     const HloInstructionProto& proto,
     const absl::flat_hash_map<int64, HloInstruction*>& instruction_map,
-    const absl::flat_hash_map<int64, HloComputation*>& computation_map) {
+    const absl::flat_hash_map<int64, HloComputation*>& computation_map,
+    bool prohibit_empty_literal) {
   TF_RET_CHECK(!proto.opcode().empty());
   HloOpcode opcode;
   auto opcode_or = StringToHloOpcode(proto.opcode());
@@ -300,8 +303,9 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     case HloOpcode::kConstant: {
       // TODO(b/110214922): Revert this to CHECK(proto.has_literal()).
       if (proto.has_literal()) {
-        TF_ASSIGN_OR_RETURN(auto literal,
-                            Literal::CreateFromProto(proto.literal()));
+        TF_ASSIGN_OR_RETURN(
+            auto literal,
+            Literal::CreateFromProto(proto.literal(), prohibit_empty_literal));
         instruction = CreateConstant(std::move(literal));
         // Literal's shape may have no/different tiling info.
         TF_RET_CHECK(Shape::Equal().MinorToMajorOnlyInLayout()(
@@ -314,8 +318,9 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     }
     case HloOpcode::kTrace: {
       TF_RET_CHECK(proto.has_literal());
-      TF_ASSIGN_OR_RETURN(auto literal,
-                          Literal::CreateFromProto(proto.literal()));
+      TF_ASSIGN_OR_RETURN(
+          auto literal,
+          Literal::CreateFromProto(proto.literal(), prohibit_empty_literal));
       instruction = CreateTrace(literal.GetR1U8AsString(), operands(0));
       break;
     }
@@ -342,6 +347,10 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     }
     case HloOpcode::kRng:
       instruction = CreateRng(shape, proto.distribution(), all_operands());
+      break;
+    case HloOpcode::kRngBitGenerator:
+      instruction =
+          CreateRngBitGenerator(shape, operands(0), proto.rng_algorithm());
       break;
     case HloOpcode::kRngGetAndUpdateState:
       instruction = CreateRngGetAndUpdateState(shape, proto.delta());
@@ -379,40 +388,93 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
                                   proto.outfeed_config());
       break;
     }
+    case HloOpcode::kAllGather: {
+      absl::optional<int64> channel_id;
+      if (proto.channel_id() > 0) {
+        channel_id = proto.channel_id();
+      }
+
+      TF_RET_CHECK(proto.dimensions_size() == 1)
+          << "AllGather cannot have more than 1 all-gather dimensions";
+      TF_RET_CHECK(all_operands().size() == 1)
+          << "AllGather must have a single operand";
+      int64 all_gather_dimension = proto.dimensions(0);
+      instruction = CreateAllGather(
+          shape, operands(0), all_gather_dimension,
+          std::vector<ReplicaGroup>(proto.replica_groups().begin(),
+                                    proto.replica_groups().end()),
+          proto.constrain_layout(), channel_id, proto.use_global_device_ids());
+      break;
+    }
     case HloOpcode::kAllReduce: {
       TF_RET_CHECK(proto.called_computation_ids_size() == 1)
           << "AllReduce should have 1 called computation but sees "
           << proto.called_computation_ids_size();
-      absl::optional<int64> all_reduce_id;
+      TF_RET_CHECK(proto.channel_id() <= 0 || proto.all_reduce_id() <= 0)
+          << "AllReduce cannot have both channel_id() and all_reduce_id()";
+      absl::optional<int64> channel_id;
+      if (proto.channel_id() > 0) {
+        channel_id = proto.channel_id();
+      }
       if (proto.all_reduce_id() > 0) {
-        all_reduce_id = proto.all_reduce_id();
+        channel_id = proto.all_reduce_id();
       }
       instruction = CreateAllReduce(
           shape, all_operands(), computations(0),
           /*replica_groups=*/
           std::vector<ReplicaGroup>(proto.replica_groups().begin(),
                                     proto.replica_groups().end()),
-          /*barrier=*/proto.all_reduce_barrier(),
-          /*all_reduce_id=*/all_reduce_id);
+          /*constrain_layout=*/proto.constrain_layout(),
+          /*channel_id=*/channel_id,
+          /*use_global_device_ids=*/proto.use_global_device_ids());
       break;
     }
     case HloOpcode::kAllToAll: {
+      absl::optional<int64> channel_id;
+      if (proto.channel_id() > 0) {
+        channel_id = proto.channel_id();
+      }
+      absl::optional<int64> split_dimension;
+      if (proto.dimensions_size() > 0) {
+        TF_RET_CHECK(proto.dimensions_size() == 1)
+            << "AllToAll cannot have more than 1 dimension (split dimension)";
+        TF_RET_CHECK(all_operands().size() == 1)
+            << "AllToAll must have a single operand when the split dimension "
+               "is specified";
+        split_dimension = proto.dimensions(0);
+      }
       instruction = CreateAllToAll(
           shape, all_operands(),
           /*replica_groups=*/
           std::vector<ReplicaGroup>(proto.replica_groups().begin(),
-                                    proto.replica_groups().end()));
+                                    proto.replica_groups().end()),
+          /*constrain_layout=*/proto.constrain_layout(),
+          /*channel_id=*/channel_id, split_dimension);
       break;
     }
-    case HloOpcode::kCollectivePermute: {
+    case HloOpcode::kCollectivePermute:
+    case HloOpcode::kCollectivePermuteStart: {
       std::vector<std::pair<int64, int64>> source_target_pairs(
           proto.source_target_pairs_size());
+      absl::optional<int64> channel_id;
+      if (proto.channel_id() > 0) {
+        channel_id = proto.channel_id();
+      }
       for (int i = 0; i < source_target_pairs.size(); i++) {
         source_target_pairs[i].first = proto.source_target_pairs(i).source();
         source_target_pairs[i].second = proto.source_target_pairs(i).target();
       }
-      instruction =
-          CreateCollectivePermute(shape, operands(0), source_target_pairs);
+
+      if (opcode == HloOpcode::kCollectivePermute) {
+        instruction = CreateCollectivePermute(shape, operands(0),
+                                              source_target_pairs, channel_id);
+      } else if (opcode == HloOpcode::kCollectivePermuteStart) {
+        instruction = CreateCollectivePermuteStart(
+            shape, operands(0), source_target_pairs, channel_id);
+      } else {
+        LOG(FATAL) << "Expect CollectivePermute or CollectivePermuteStart, "
+                   << "but got " << HloOpcodeString(opcode);
+      }
       break;
     }
     case HloOpcode::kReplicaId: {
@@ -465,9 +527,15 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
             CreateCustomCall(shape, all_operands(), proto.custom_call_target(),
                              operand_shapes, proto.backend_config());
       } else {
-        instruction =
-            CreateCustomCall(shape, all_operands(), proto.custom_call_target(),
-                             proto.backend_config());
+        if (proto.called_computation_ids_size() == 1) {
+          instruction = CreateCustomCall(shape, all_operands(), computations(0),
+                                         proto.custom_call_target(),
+                                         proto.backend_config());
+        } else {
+          instruction = CreateCustomCall(shape, all_operands(),
+                                         proto.custom_call_target(),
+                                         proto.backend_config());
+        }
       }
       auto custom_call_instr =
           Cast<HloCustomCallInstruction>(instruction.get());
@@ -479,9 +547,9 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
             proto.convolution_dimension_numbers());
       }
       custom_call_instr->set_feature_group_count(
-          std::max(static_cast<int64>(proto.feature_group_count()), 1LL));
+          std::max(static_cast<int64>(proto.feature_group_count()), int64{1}));
       custom_call_instr->set_batch_group_count(
-          std::max(static_cast<int64>(proto.batch_group_count()), 1LL));
+          std::max(static_cast<int64>(proto.batch_group_count()), int64{1}));
       custom_call_instr->set_custom_call_has_side_effect(
           proto.custom_call_has_side_effect());
       break;
@@ -534,15 +602,15 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     case HloOpcode::kGather: {
       TF_RET_CHECK(proto.has_gather_dimension_numbers())
           << "Gather instruction should have GatherDimensionNumbers set.";
-      std::unique_ptr<GatherDimensionNumbers> gather_dimension_numbers =
-          absl::make_unique<GatherDimensionNumbers>(
-              proto.gather_dimension_numbers());
+      auto gather_dimension_numbers = absl::make_unique<GatherDimensionNumbers>(
+          proto.gather_dimension_numbers());
       std::vector<int64> gather_slice_sizes;
       for (int64 bound : proto.gather_slice_sizes()) {
         gather_slice_sizes.push_back(bound);
       }
       instruction = CreateGather(shape, operands(0), operands(1),
-                                 *gather_dimension_numbers, gather_slice_sizes);
+                                 *gather_dimension_numbers, gather_slice_sizes,
+                                 proto.indices_are_sorted());
       break;
     }
     case HloOpcode::kScatter: {
@@ -554,8 +622,10 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
       auto scatter_dimension_numbers =
           absl::make_unique<ScatterDimensionNumbers>(
               proto.scatter_dimension_numbers());
-      instruction = CreateScatter(shape, operands(0), operands(1), operands(2),
-                                  computations(0), *scatter_dimension_numbers);
+      instruction =
+          CreateScatter(shape, operands(0), operands(1), operands(2),
+                        computations(0), *scatter_dimension_numbers,
+                        proto.indices_are_sorted(), proto.unique_indices());
       break;
     }
     case HloOpcode::kIota:
@@ -601,6 +671,24 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
       instruction =
           CreateGetDimensionSize(shape, operands(0), proto.dimensions(0));
       break;
+    case HloOpcode::kSetDimensionSize:
+      TF_RET_CHECK(proto.dimensions_size() == 1);
+      instruction = CreateSetDimensionSize(shape, operands(0), operands(1),
+                                           proto.dimensions(0));
+      break;
+    case HloOpcode::kReshape: {
+      int64 inferred_dimension = -1;
+      if (!proto.dimensions().empty()) {
+        inferred_dimension = proto.dimensions()[0];
+      }
+      TF_RET_CHECK(shape.IsArray() && operands(0)->shape().IsArray() &&
+                   ShapeUtil::ElementsIn(shape) ==
+                       ShapeUtil::ElementsIn(operands(0)->shape()))
+          << "shape: " << ShapeUtil::HumanString(shape)
+          << " operand: " << ShapeUtil::HumanString(operands(0)->shape());
+      instruction = CreateReshape(shape, operands(0), inferred_dimension);
+      break;
+    }
     default: {
       instruction = absl::WrapUnique(new HloInstruction(opcode, shape));
       for (const int64 operand_id : proto.operand_ids()) {
@@ -651,6 +739,10 @@ StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
     instruction->set_sharding(sharding);
   }
 
+  if (proto.has_frontend_attributes()) {
+    instruction->set_frontend_attributes(proto.frontend_attributes());
+  }
+
   return std::move(instruction);
 }
 
@@ -693,6 +785,13 @@ HloInstruction::CreateRngGetAndUpdateState(const Shape& shape, int64 delta) {
   return absl::make_unique<HloRngGetAndUpdateStateInstruction>(shape, delta);
 }
 
+/* static */ std::unique_ptr<HloInstruction>
+HloInstruction::CreateRngBitGenerator(const Shape& shape, HloInstruction* state,
+                                      RandomAlgorithm algorithm) {
+  return absl::make_unique<HloRngBitGeneratorInstruction>(shape, state,
+                                                          algorithm);
+}
+
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateNary(
     const Shape& shape, HloOpcode opcode,
     absl::Span<HloInstruction* const> operands) {
@@ -716,6 +815,7 @@ HloInstruction::CreateRngGetAndUpdateState(const Shape& shape, int64 delta) {
     case HloOpcode::kRoundNearestAfz:
     case HloOpcode::kBitcast:
     case HloOpcode::kCeil:
+    case HloOpcode::kCollectivePermuteDone:
     case HloOpcode::kCopy:
     case HloOpcode::kCopyStart:
     case HloOpcode::kCopyDone:
@@ -736,6 +836,7 @@ HloInstruction::CreateRngGetAndUpdateState(const Shape& shape, int64 delta) {
     case HloOpcode::kSign:
     case HloOpcode::kSin:
     case HloOpcode::kSqrt:
+    case HloOpcode::kCbrt:
     case HloOpcode::kTanh:
       break;
     default:
@@ -857,29 +958,53 @@ HloInstruction::CreateReducePrecision(const Shape& shape,
       shape, operand, exponent_bits, mantissa_bits);
 }
 
+/* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateAllGather(
+    const Shape& shape, HloInstruction* operand, int64 all_gather_dimension,
+    const std::vector<ReplicaGroup>& replica_groups, bool constrain_layout,
+    const absl::optional<int64>& channel_id, bool use_global_device_ids) {
+  return absl::make_unique<HloAllGatherInstruction>(
+      shape, operand, all_gather_dimension, replica_groups, constrain_layout,
+      channel_id, use_global_device_ids);
+}
+
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateAllReduce(
     const Shape& shape, absl::Span<HloInstruction* const> operands,
     HloComputation* reduce_computation,
-    const std::vector<ReplicaGroup>& replica_groups, absl::string_view barrier,
-    const absl::optional<int64>& all_reduce_id) {
+    const std::vector<ReplicaGroup>& replica_groups, bool constrain_layout,
+    const absl::optional<int64>& channel_id, bool use_global_device_ids) {
   return absl::make_unique<HloAllReduceInstruction>(
-      shape, operands, reduce_computation, replica_groups, barrier,
-      all_reduce_id);
+      shape, operands, reduce_computation, replica_groups, constrain_layout,
+      channel_id, use_global_device_ids);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateAllToAll(
     const Shape& shape, absl::Span<HloInstruction* const> operands,
-    const std::vector<ReplicaGroup>& replica_groups) {
-  return absl::make_unique<HloAllToAllInstruction>(shape, operands,
-                                                   replica_groups);
+    const std::vector<ReplicaGroup>& replica_groups, bool constrain_layout,
+    const absl::optional<int64>& channel_id,
+    const absl::optional<int64>& split_dimension) {
+  return absl::make_unique<HloAllToAllInstruction>(
+      shape, operands, replica_groups, constrain_layout, channel_id,
+      split_dimension);
 }
 
 /* static */ std::unique_ptr<HloInstruction>
 HloInstruction::CreateCollectivePermute(
     const Shape& shape, HloInstruction* operand,
-    const std::vector<std::pair<int64, int64>>& source_target_pairs) {
+    const std::vector<std::pair<int64, int64>>& source_target_pairs,
+    const absl::optional<int64>& channel_id) {
   return absl::make_unique<HloCollectivePermuteInstruction>(
-      shape, operand, source_target_pairs);
+      HloOpcode::kCollectivePermute, shape, operand, source_target_pairs,
+      channel_id);
+}
+
+/* static */ std::unique_ptr<HloInstruction>
+HloInstruction::CreateCollectivePermuteStart(
+    const Shape& shape, HloInstruction* operand,
+    const std::vector<std::pair<int64, int64>>& source_target_pairs,
+    const absl::optional<int64>& channel_id) {
+  return absl::make_unique<HloCollectivePermuteInstruction>(
+      HloOpcode::kCollectivePermuteStart, shape, operand, source_target_pairs,
+      channel_id);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateReplicaId() {
@@ -1063,6 +1188,14 @@ HloInstruction::CreateBitcastConvert(const Shape& shape,
   return instruction;
 }
 
+/* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateBitcast(
+    const Shape& shape, HloInstruction* operand) {
+  auto instruction =
+      absl::WrapUnique(new HloInstruction(HloOpcode::kBitcast, shape));
+  instruction->AppendOperand(operand);
+  return instruction;
+}
+
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateReduce(
     const Shape& shape, HloInstruction* operand, HloInstruction* init_value,
     absl::Span<const int64> dimensions_to_reduce,
@@ -1147,6 +1280,14 @@ HloInstruction::CreateGetDimensionSize(const Shape& shape,
 }
 
 /* static */ std::unique_ptr<HloInstruction>
+HloInstruction::CreateSetDimensionSize(const Shape& shape,
+                                       HloInstruction* operand,
+                                       HloInstruction* val, int64 dimension) {
+  return absl::make_unique<HloSetDimensionSizeInstruction>(shape, operand, val,
+                                                           dimension);
+}
+
+/* static */ std::unique_ptr<HloInstruction>
 HloInstruction::CreateBroadcastSequence(
     const Shape& output_shape, HloInstruction* operand,
     const std::function<HloInstruction*(std::unique_ptr<HloInstruction>)>&
@@ -1163,6 +1304,7 @@ HloInstruction::CreateBroadcastSequence(
     if (operand->has_sharding()) {
       broadcast->set_sharding(operand->sharding());
     }
+    broadcast->set_frontend_attributes(operand->frontend_attributes());
     return broadcast;
   }
   // Do explicit broadcast for degenerate broadcast.
@@ -1188,6 +1330,7 @@ HloInstruction::CreateBroadcastSequence(
   if (operand->has_sharding()) {
     reshaped_operand->set_sharding(operand->sharding());
   }
+  reshaped_operand->set_frontend_attributes(operand->frontend_attributes());
   // Broadcast 'reshape' up to the larger size.
   auto broadcast = HloInstruction::CreateBroadcast(
       broadcast_shape, reshaped_operand, broadcast_dimensions);
@@ -1195,6 +1338,7 @@ HloInstruction::CreateBroadcastSequence(
   if (operand->has_sharding()) {
     broadcast->set_sharding(operand->sharding());
   }
+  broadcast->set_frontend_attributes(operand->frontend_attributes());
   return broadcast;
 }
 
@@ -1206,15 +1350,14 @@ HloInstruction::CreateBroadcastSequence(
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateReshape(
-    const Shape& shape, HloInstruction* operand) {
+    const Shape& shape, HloInstruction* operand, int64 inferred_dimension) {
   CHECK_EQ(ShapeUtil::ElementsIn(shape),
            ShapeUtil::ElementsIn(operand->shape()))
       << "shape: " << ShapeUtil::HumanString(shape)
       << " operand: " << ShapeUtil::HumanString(operand->shape());
-  auto instruction =
-      absl::WrapUnique(new HloInstruction(HloOpcode::kReshape, shape));
-  instruction->AppendOperand(operand);
-  return instruction;
+
+  return absl::make_unique<HloReshapeInstruction>(shape, operand,
+                                                  inferred_dimension);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateTranspose(
@@ -1266,6 +1409,7 @@ void HloInstruction::SetupDerivedInstruction(
     derived_instruction->clear_sharding();
   }
   derived_instruction->set_metadata(metadata_);
+  derived_instruction->set_frontend_attributes(frontend_attributes_);
 }
 
 bool HloInstruction::HasSideEffectNoRecurse() const {
@@ -1281,7 +1425,10 @@ bool HloInstruction::HasSideEffectNoRecurse() const {
     case HloOpcode::kTrace:
       return true;
     case HloOpcode::kAllReduce:
-      return all_reduce_id().has_value();
+      return channel_id().has_value() ||
+             Cast<HloAllReduceInstruction>(this)->constrain_layout();
+    case HloOpcode::kAllToAll:
+      return Cast<HloAllToAllInstruction>(this)->constrain_layout();
     case HloOpcode::kCustomCall:
       return Cast<HloCustomCallInstruction>(this)
           ->custom_call_has_side_effect();
@@ -1324,6 +1471,14 @@ bool HloInstruction::HasSideEffect() const {
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateCustomCall(
     const Shape& shape, absl::Span<HloInstruction* const> operands,
+    HloComputation* to_apply, absl::string_view custom_call_target,
+    string opaque) {
+  return absl::make_unique<HloCustomCallInstruction>(
+      shape, operands, to_apply, custom_call_target, std::move(opaque));
+}
+
+/* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateCustomCall(
+    const Shape& shape, absl::Span<HloInstruction* const> operands,
     absl::string_view custom_call_target,
     absl::Span<const Shape> operand_shapes_with_layout, string opaque) {
   return absl::make_unique<HloCustomCallInstruction>(
@@ -1344,19 +1499,21 @@ bool HloInstruction::HasSideEffect() const {
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateGather(
     const Shape& shape, HloInstruction* operand, HloInstruction* start_indices,
     const GatherDimensionNumbers& gather_dim_numbers,
-    absl::Span<const int64> slice_sizes) {
+    absl::Span<const int64> slice_sizes, bool indices_are_sorted) {
   return absl::make_unique<HloGatherInstruction>(
-      shape, operand, start_indices, gather_dim_numbers, slice_sizes);
+      shape, operand, start_indices, gather_dim_numbers, slice_sizes,
+      indices_are_sorted);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateScatter(
     const Shape& shape, HloInstruction* operand,
     HloInstruction* scatter_indices, HloInstruction* updates,
     HloComputation* update_computation,
-    const ScatterDimensionNumbers& scatter_dim_numbers) {
+    const ScatterDimensionNumbers& scatter_dim_numbers, bool indices_are_sorted,
+    bool unique_indices) {
   return absl::make_unique<HloScatterInstruction>(
       shape, operand, scatter_indices, updates, update_computation,
-      scatter_dim_numbers);
+      scatter_dim_numbers, indices_are_sorted, unique_indices);
 }
 
 /* static */ std::unique_ptr<HloInstruction> HloInstruction::CreateDomain(
@@ -1398,19 +1555,23 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kReduce:
     case HloOpcode::kTranspose:
     case HloOpcode::kBroadcast:
+    case HloOpcode::kReshape:
     case HloOpcode::kMap:
     case HloOpcode::kSlice:
     case HloOpcode::kConstant:
     case HloOpcode::kTrace:
     case HloOpcode::kFusion:
     case HloOpcode::kRng:
+    case HloOpcode::kRngBitGenerator:
     case HloOpcode::kRngGetAndUpdateState:
     case HloOpcode::kParameter:
     case HloOpcode::kGetTupleElement:
     case HloOpcode::kReducePrecision:
+    case HloOpcode::kAllGather:
     case HloOpcode::kAllReduce:
     case HloOpcode::kAllToAll:
     case HloOpcode::kCollectivePermute:
+    case HloOpcode::kCollectivePermuteStart:
     case HloOpcode::kInfeed:
     case HloOpcode::kOutfeed:
     case HloOpcode::kConvolution:
@@ -1426,6 +1587,7 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kDot:
     case HloOpcode::kDomain:
     case HloOpcode::kGetDimensionSize:
+    case HloOpcode::kSetDimensionSize:
     case HloOpcode::kTriangularSolve:
     case HloOpcode::kCholesky:
       clone = CloneWithNewOperandsImpl(shape, new_operands, context);
@@ -1436,6 +1598,7 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kBitcast:
     case HloOpcode::kCeil:
     case HloOpcode::kClz:
+    case HloOpcode::kCollectivePermuteDone:
     case HloOpcode::kCopy:
     case HloOpcode::kCopyStart:
     case HloOpcode::kCopyDone:
@@ -1455,6 +1618,7 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kSign:
     case HloOpcode::kSin:
     case HloOpcode::kSqrt:
+    case HloOpcode::kCbrt:
     case HloOpcode::kTanh:
       CHECK_EQ(new_operands.size(), 1);
       clone = CreateUnary(shape, opcode_, new_operands[0]);
@@ -1499,10 +1663,6 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
       CHECK_EQ(new_operands.size(), 1);
       clone = CreateBitcastConvert(shape, new_operands[0]);
       break;
-    case HloOpcode::kReshape:
-      CHECK_EQ(new_operands.size(), 1);
-      clone = CreateReshape(shape, new_operands[0]);
-      break;
     case HloOpcode::kDynamicUpdateSlice:
       clone = CreateDynamicUpdateSlice(shape, new_operands[0], new_operands[1],
                                        new_operands.subspan(2));
@@ -1536,10 +1696,12 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
     case HloOpcode::kReplicaId:
       CHECK_EQ(new_operands.size(), 0);
       clone = CreateReplicaId();
+      *clone->mutable_shape() = shape;
       break;
     case HloOpcode::kPartitionId:
       CHECK_EQ(new_operands.size(), 0);
       clone = CreatePartitionId();
+      *clone->mutable_shape() = shape;
       break;
   }
   // SetupDerivedInstruction will setup the precision_config_ field.
@@ -1558,7 +1720,11 @@ std::unique_ptr<HloInstruction> HloInstruction::CloneWithNewOperands(
   return clone;
 }
 
-HloInstruction::~HloInstruction() {
+void HloInstruction::DetachFromOperandsAndUsers() {
+  if (cleaned_up_) {
+    return;
+  }
+  cleaned_up_ = true;
   // Detach from operands. An instruction may be repeated as an operand. To
   // avoid calling RemoveUser twice on the same operand, check before remove.
   for (int64 operand_num = 0; operand_num < operand_count(); ++operand_num) {
@@ -1566,13 +1732,13 @@ HloInstruction::~HloInstruction() {
     if (operand == nullptr) {
       continue;
     }
-    if (operand->user_set_.find(this) != operand->user_set_.end()) {
+    if (operand->user_map_.find(this) != operand->user_map_.end()) {
       operand->RemoveUser(this);
     }
     operands_[operand_num] = nullptr;
   }
 
-  // Update users. Set `nullptr` to the correpsonding operand slot for users.
+  // Update users. Set `nullptr` to the corresponding operand slot for users.
   for (auto& user : this->users()) {
     for (int i = 0; i < user->operand_count(); ++i) {
       if (user->operands_[i] == this) {
@@ -1749,10 +1915,16 @@ void HloInstruction::RemoveOperandsAtAscendingIndices(
 }
 
 void HloInstruction::AddUser(HloInstruction* user) {
-  if (!ContainsKey(user_set_, user)) {
-    user_set_.insert(user);
+  if (!ContainsKey(user_map_, user)) {
+    user_map_.emplace(user, users_.size());
     users_.push_back(user);
   }
+}
+
+int64 HloInstruction::UserId(HloInstruction* user) {
+  auto result = user_map_.find(user);
+  CHECK(result != user_map_.end());
+  return result->second;
 }
 
 bool HloInstruction::HasConstantOperand() const {
@@ -1780,6 +1952,7 @@ bool HloInstruction::IdenticalSlowPath(
     case HloOpcode::kCeil:
     case HloOpcode::kClamp:
     case HloOpcode::kClz:
+    case HloOpcode::kCollectivePermuteDone:
     case HloOpcode::kComplex:
     case HloOpcode::kConvert:
     case HloOpcode::kCopy:
@@ -1819,6 +1992,7 @@ bool HloInstruction::IdenticalSlowPath(
     case HloOpcode::kSign:
     case HloOpcode::kSin:
     case HloOpcode::kSqrt:
+    case HloOpcode::kCbrt:
     case HloOpcode::kSubtract:
     case HloOpcode::kTanh:
     case HloOpcode::kTuple:
@@ -1869,15 +2043,18 @@ bool HloInstruction::IdenticalSlowPath(
     case HloOpcode::kTrace:
     case HloOpcode::kFusion:
     case HloOpcode::kRng:
+    case HloOpcode::kRngBitGenerator:
     case HloOpcode::kRngGetAndUpdateState:
     case HloOpcode::kParameter:
     case HloOpcode::kGetTupleElement:
     case HloOpcode::kReducePrecision:
     case HloOpcode::kInfeed:
     case HloOpcode::kOutfeed:
+    case HloOpcode::kAllGather:
     case HloOpcode::kAllReduce:
     case HloOpcode::kAllToAll:
     case HloOpcode::kCollectivePermute:
+    case HloOpcode::kCollectivePermuteStart:
     case HloOpcode::kConvolution:
     case HloOpcode::kCustomCall:
     case HloOpcode::kReduceWindow:
@@ -1889,6 +2066,7 @@ bool HloInstruction::IdenticalSlowPath(
     case HloOpcode::kDot:
     case HloOpcode::kDomain:
     case HloOpcode::kGetDimensionSize:
+    case HloOpcode::kSetDimensionSize:
     case HloOpcode::kTriangularSolve:
     case HloOpcode::kCholesky:
       LOG(FATAL) << "Base class impl called for opcode with subclass: "
@@ -1928,14 +2106,20 @@ uint64 HloInstruction::Hash() const {
 uint64 HloInstruction::InnerHash() const { return 13; }
 
 void HloInstruction::RemoveUser(HloInstruction* user) {
-  auto set_it = user_set_.find(user);
-  CHECK(set_it != user_set_.end());
-  user_set_.erase(set_it);
-  // This is linear in the number of the users, but a vector provides a stable
-  // iteration order and much faster traversal.
-  auto vec_it = absl::c_find(users_, user);
-  CHECK(vec_it != users_.end());
-  users_.erase(vec_it);
+  auto map_it = user_map_.find(user);
+  CHECK(map_it != user_map_.end());
+
+  const int64 index = map_it->second;
+  CHECK_EQ(users_[index], user);
+
+  // Move the last user into the position of the removed user.
+  users_[index] = users_.back();
+  user_map_[users_.back()] = index;
+
+  // Remove the user from the map and drop the last slot from the vector what
+  // have been moved to the position of the original user.
+  user_map_.erase(map_it);
+  users_.pop_back();
 }
 
 Status HloInstruction::ReplaceUseWith(HloInstruction* user,
@@ -2026,7 +2210,7 @@ Status HloInstruction::ReplaceAllUsesWithDifferentShape(
     }
   }
   users_.clear();
-  user_set_.clear();
+  user_map_.clear();
   if (new_producer_is_user) {
     AddUser(new_producer);
   }
@@ -2038,6 +2222,13 @@ Status HloInstruction::ReplaceAllUsesWithDifferentShape(
   return Status::OK();
 }
 
+bool HloInstruction::IsEffectiveBitcast() const {
+  return opcode_ == HloOpcode::kBitcast ||
+         (opcode_ == HloOpcode::kTranspose &&
+          ShapeUtil::TransposeIsBitcast(operand(0)->shape(), shape(),
+                                        dimensions()));
+}
+
 HloComputation* HloInstruction::to_apply() const {
   switch (opcode_) {
     case HloOpcode::kCall:
@@ -2047,6 +2238,7 @@ HloComputation* HloInstruction::to_apply() const {
     case HloOpcode::kAllReduce:
     case HloOpcode::kScatter:
     case HloOpcode::kSort:
+    case HloOpcode::kCustomCall:
       CHECK_EQ(called_computations_.size(), 1);
       return called_computations_[0];
     default:
@@ -2067,6 +2259,7 @@ void HloInstruction::set_to_apply(HloComputation* computation) {
     case HloOpcode::kAllReduce:
     case HloOpcode::kScatter:
     case HloOpcode::kSort:
+    case HloOpcode::kCustomCall:
       CHECK_EQ(called_computations_.size(), 1);
       called_computations_[0] = computation;
       break;
@@ -2154,10 +2347,61 @@ string HloInstruction::SignatureString() const {
   return StrCat("(", operands, ") -> ", ShapeUtil::HumanString(shape()));
 }
 
+string PrintName(const string& name, bool print_ids) {
+  if (print_ids) {
+    return name;
+  } else {
+    auto dot_position = name.find_first_of(".");
+    return name.substr(0, dot_position);
+  }
+}
+
 namespace {
 
-string PrintName(const string& name, const HloPrintOptions& options) {
-  return StrCat(options.print_percent() ? "%" : "", name);
+using DFSStack = absl::InlinedVector<std::pair<int, HloInstruction*>, 16>;
+
+string PrintNameInternal(const string& name, const HloPrintOptions& options) {
+  return StrCat(options.print_percent() ? "%" : "",
+                PrintName(name, options.print_ids()));
+}
+
+void PrintCycle(const HloInstruction* child, DFSStack* dfs_stack) {
+  // This set contains HloInstructions from the top of `DFSStack` that might
+  // belong to the cycle, i.e. if  DFSStack :=[back,...,child,...,top], then
+  // `subgraph` := {child,...,top}.
+  absl::flat_hash_set<const HloInstruction*> subgraph;
+  while (!dfs_stack->empty() && dfs_stack->back().second != child) {
+    subgraph.insert(dfs_stack->back().second);
+    dfs_stack->pop_back();
+  }
+  // Start dfs at `child` and find a cycle with all nodes in `subgraph`.
+  absl::flat_hash_set<const HloInstruction*> visited;
+  absl::InlinedVector<const HloInstruction*, 16> dfs;
+  dfs.push_back(child);
+  while (!dfs.empty()) {
+    bool found_next_instr = false;
+    for (const auto& user : dfs.back()->users()) {
+      if (user == child) {
+        dfs.push_back(child);
+        LOG(INFO) << "\n\nDirected cycle:\n  "
+                  << absl::StrJoin(
+                         dfs, "\n  ",
+                         [](std::string* out, const HloInstruction* instr) {
+                           out->append(instr->name());
+                         });
+        return;
+      }
+      if (!subgraph.contains(user) || visited.contains(user)) {
+        continue;
+      }
+      visited.insert(user);
+      dfs.push_back(user);
+      found_next_instr = true;
+    }
+    if (!found_next_instr) {
+      dfs.pop_back();
+    }
+  }
 }
 
 }  // namespace
@@ -2195,6 +2439,7 @@ bool HloInstruction::IsElementwiseImpl(
     case HloOpcode::kSign:
     case HloOpcode::kSin:
     case HloOpcode::kSqrt:
+    case HloOpcode::kCbrt:
     case HloOpcode::kTanh:
       CHECK_EQ(1, operand_count());
       return true;
@@ -2234,11 +2479,11 @@ bool HloInstruction::IsElementwiseImpl(
 }
 
 bool HloInstruction::IsCrossModuleAllReduce() const {
-  return opcode() == HloOpcode::kAllReduce && all_reduce_id();
+  return opcode() == HloOpcode::kAllReduce && channel_id();
 }
 
 bool HloInstruction::IsCrossReplicaAllReduce() const {
-  return opcode() == HloOpcode::kAllReduce && !all_reduce_id();
+  return opcode() == HloOpcode::kAllReduce && !channel_id();
 }
 
 string HloInstruction::ToStringWithCanonicalNameMap(
@@ -2252,22 +2497,25 @@ string HloInstruction::ToStringWithCanonicalNameMap(
       // If we are canonicalizing instruction names and this is a top-level
       // HloInstruction::ToString() call, don't print an instruction name.
       StrAppend(&result,
-                PrintName(canonical_name_map->LookupOrInsert(name()), options),
+                PrintNameInternal(canonical_name_map->LookupOrInsert(name()),
+                                  options),
                 " = ");
     }
   } else {
-    StrAppend(&result, PrintName(name(), options), " = ");
+    StrAppend(&result, PrintNameInternal(name(), options), " = ");
   }
 
-  // Print shape.
-  if (options.include_layout_in_shapes()) {
-    StrAppend(&result, ShapeUtil::HumanStringWithLayout(shape()));
-  } else {
-    StrAppend(&result, ShapeUtil::HumanString(shape()));
+  if (options.print_result_shape()) {
+    // Print shape.
+    if (options.include_layout_in_shapes()) {
+      StrAppend(&result, ShapeUtil::HumanStringWithLayout(shape()), " ");
+    } else {
+      StrAppend(&result, ShapeUtil::HumanString(shape()), " ");
+    }
   }
 
   // Print opcode, operand(s).
-  StrAppend(&result, " ", HloOpcodeString(opcode()), "(",
+  StrAppend(&result, HloOpcodeString(opcode()), "(",
             OperandsToStringWithCanonicalNameMap(options, canonical_name_map),
             ")");
 
@@ -2322,10 +2570,10 @@ string HloInstruction::OperandsToStringWithCanonicalNameMap(
     // part of the canonical string.
     if (options.canonicalize_instruction_names() &&
         options.is_in_nested_computation()) {
-      str.push_back(PrintName(
+      str.push_back(PrintNameInternal(
           canonical_name_map->LookupOrInsert(operand->name()), options));
     } else if (options.print_operand_names()) {
-      str.push_back(PrintName(operand->name(), options));
+      str.push_back(PrintNameInternal(operand->name(), options));
     }
     StrAppend(out, StrJoin(str, " "));
   });
@@ -2338,32 +2586,37 @@ string HloInstruction::OperandsToStringWithCanonicalNameMap(
 
 std::vector<string> HloInstruction::ExtraAttributesToString(
     const HloPrintOptions& options) const {
-  std::vector<string> extra = ExtraAttributesToStringImpl(options);
+  std::vector<string> extra = options.print_extra_attributes()
+                                  ? ExtraAttributesToStringImpl(options)
+                                  : std::vector<string>();
 
   if (options.print_subcomputation_mode() ==
       HloPrintOptions::PrintSubcomputationMode::kNameOnly) {
     if (opcode() == HloOpcode::kWhile) {
+      extra.push_back(StrCat(
+          "condition=", PrintNameInternal(while_condition()->name(), options)));
       extra.push_back(
-          StrCat("condition=", PrintName(while_condition()->name(), options)));
-      extra.push_back(
-          StrCat("body=", PrintName(while_body()->name(), options)));
+          StrCat("body=", PrintNameInternal(while_body()->name(), options)));
     } else if (opcode() == HloOpcode::kSelectAndScatter) {
-      extra.push_back(StrCat("select=", PrintName(select()->name(), options)));
       extra.push_back(
-          StrCat("scatter=", PrintName(scatter()->name(), options)));
+          StrCat("select=", PrintNameInternal(select()->name(), options)));
+      extra.push_back(
+          StrCat("scatter=", PrintNameInternal(scatter()->name(), options)));
     } else if (opcode() == HloOpcode::kConditional) {
       if (operand(0)->shape().element_type() == PRED) {
-        extra.push_back(StrCat("true_computation=",
-                               PrintName(true_computation()->name(), options)));
+        extra.push_back(
+            StrCat("true_computation=",
+                   PrintNameInternal(true_computation()->name(), options)));
         extra.push_back(
             StrCat("false_computation=",
-                   PrintName(false_computation()->name(), options)));
+                   PrintNameInternal(false_computation()->name(), options)));
       } else {
         extra.push_back(StrCat(
             "branch_computations={",
             StrJoin(branch_computations(), ", ",
                     [&](string* out, const HloComputation* computation) {
-                      StrAppend(out, PrintName(computation->name(), options));
+                      StrAppend(
+                          out, PrintNameInternal(computation->name(), options));
                     }),
             "}"));
       }
@@ -2374,13 +2627,14 @@ std::vector<string> HloInstruction::ExtraAttributesToString(
                opcode() == HloOpcode::kScatter ||
                opcode() == HloOpcode::kSort) {
       extra.push_back(
-          StrCat("to_apply=", PrintName(to_apply()->name(), options)));
+          StrCat("to_apply=", PrintNameInternal(to_apply()->name(), options)));
     } else if (!called_computations().empty()) {
       extra.push_back(StrCat(
           "calls=",
           StrJoin(called_computations(), ", ",
                   [&](string* out, const HloComputation* computation) {
-                    StrAppend(out, PrintName(computation->name(), options));
+                    StrAppend(out,
+                              PrintNameInternal(computation->name(), options));
                   })));
     }
   } else if (options.print_subcomputation_mode() ==
@@ -2439,6 +2693,10 @@ std::vector<string> HloInstruction::ExtraAttributesToString(
   if (has_sharding()) {
     extra.push_back(StrCat("sharding=", sharding().ToString()));
   }
+  if (!frontend_attributes_.map().empty()) {
+    extra.push_back(StrCat("frontend_attributes=",
+                           FrontendAttributesToString(frontend_attributes_)));
+  }
   if (!outer_dimension_partitions_.empty()) {
     extra.push_back(absl::StrFormat("outer_dimension_partitions={%s}",
                                     StrJoin(outer_dimension_partitions_, ",")));
@@ -2448,8 +2706,8 @@ std::vector<string> HloInstruction::ExtraAttributesToString(
     extra.push_back(StrCat("control-predecessors={",
                            StrJoin(control_predecessors_, ", ",
                                    [&](string* out, HloInstruction* pre) {
-                                     StrAppend(out,
-                                               PrintName(pre->name(), options));
+                                     StrAppend(out, PrintNameInternal(
+                                                        pre->name(), options));
                                    }),
                            "}"));
   }
@@ -2498,6 +2756,8 @@ HloInstructionProto HloInstruction::ToProto() const {
       proto.mutable_outer_dimension_partitions()->Add(idx);
     }
   }
+
+  *proto.mutable_frontend_attributes() = frontend_attributes_;
 
   return proto;
 }
@@ -2548,8 +2808,18 @@ bool HloInstruction::IsFusible() const {
   switch (opcode_) {
     case HloOpcode::kDomain:
     case HloOpcode::kParameter:
+    case HloOpcode::kWhile:
+    case HloOpcode::kConditional:
+    case HloOpcode::kCall:
       return false;
-    // Side effecting instrutions cannot be fused.
+    // Fusions are always fusible.
+    case HloOpcode::kFusion:
+    // Side effecting reduce and reduce window would be invalid HLO.
+    case HloOpcode::kMap:
+    case HloOpcode::kReduce:
+    case HloOpcode::kReduceWindow:
+      return true;
+    // Side effecting instructions cannot be fused.
     default:
       return !HasSideEffect();
   }
@@ -2636,12 +2906,18 @@ Status HloInstruction::Visit(DfsHloVisitorBase<HloInstructionPtr>* visitor) {
       return visitor->HandleConvolution(this);
     case HloOpcode::kFft:
       return visitor->HandleFft(this);
+    case HloOpcode::kAllGather:
+      return visitor->HandleAllGather(this);
     case HloOpcode::kAllReduce:
       return visitor->HandleAllReduce(this);
     case HloOpcode::kAllToAll:
       return visitor->HandleAllToAll(this);
     case HloOpcode::kCollectivePermute:
       return visitor->HandleCollectivePermute(this);
+    case HloOpcode::kCollectivePermuteStart:
+      return visitor->HandleCollectivePermuteStart(this);
+    case HloOpcode::kCollectivePermuteDone:
+      return visitor->HandleCollectivePermuteDone(this);
     case HloOpcode::kReplicaId:
       return visitor->HandleReplicaId(this);
     case HloOpcode::kPartitionId:
@@ -2682,6 +2958,8 @@ Status HloInstruction::Visit(DfsHloVisitorBase<HloInstructionPtr>* visitor) {
       return visitor->HandleSin(this);
     case HloOpcode::kSqrt:
       return visitor->HandleSqrt(this);
+    case HloOpcode::kCbrt:
+      return visitor->HandleCbrt(this);
     case HloOpcode::kRsqrt:
       return visitor->HandleRsqrt(this);
     case HloOpcode::kReal:
@@ -2722,6 +3000,8 @@ Status HloInstruction::Visit(DfsHloVisitorBase<HloInstructionPtr>* visitor) {
       return visitor->HandleOutfeed(this);
     case HloOpcode::kRng:
       return visitor->HandleRng(this);
+    case HloOpcode::kRngBitGenerator:
+      return visitor->HandleRngBitGenerator(this);
     case HloOpcode::kRngGetAndUpdateState:
       return visitor->HandleRngGetAndUpdateState(this);
     case HloOpcode::kWhile:
@@ -2760,6 +3040,8 @@ Status HloInstruction::Visit(DfsHloVisitorBase<HloInstructionPtr>* visitor) {
       return visitor->HandleIota(this);
     case HloOpcode::kGetDimensionSize:
       return visitor->HandleGetDimensionSize(this);
+    case HloOpcode::kSetDimensionSize:
+      return visitor->HandleSetDimensionSize(this);
     case HloOpcode::kTriangularSolve:
       return visitor->HandleTriangularSolve(this);
     case HloOpcode::kCholesky:
@@ -2767,7 +3049,7 @@ Status HloInstruction::Visit(DfsHloVisitorBase<HloInstructionPtr>* visitor) {
 
     // These opcodes are not handled here.
     case HloOpcode::kTrace:
-      break;
+      return Status::OK();
   }
   return InternalError(
       "Unhandled HloOpcode for DfsHloVisitor: %s. This should not happen - "
@@ -2778,8 +3060,6 @@ Status HloInstruction::Visit(DfsHloVisitorBase<HloInstructionPtr>* visitor) {
 // Explicit instantiations.
 template Status HloInstruction::Visit(DfsHloVisitor* visitor);
 template Status HloInstruction::Visit(ConstDfsHloVisitor* visitor);
-
-using DFSStack = absl::InlinedVector<std::pair<int, HloInstruction*>, 16>;
 
 // Push "child" onto the dfs_stack if not already visited.  Returns false if a
 // cycle was detected, and true otherwise.
@@ -2837,8 +3117,8 @@ static Status PostOrderDFS(HloInstruction* root, Visitor* visitor,
         visitor->GetVisitState(current_id);
     if (visit_state == Visitor::kVisited) {
       dfs_stack.pop_back();
-      VLOG(3) << "Not visiting HLO %" << current_node->name()
-              << " as it was already visited.";
+      VLOG(3) << "Not visiting HLO (id = " << current_id
+              << ") as it was already visited.";
       continue;
     }
 
@@ -2858,6 +3138,7 @@ static Status PostOrderDFS(HloInstruction* root, Visitor* visitor,
     const size_t old_dfs_stack_size = dfs_stack.size();
     for (HloInstruction* child : current_node->operands()) {
       if (!TF_PREDICT_TRUE(PushDFSChild(visitor, &dfs_stack, child))) {
+        PrintCycle(child, &dfs_stack);
         return FailedPrecondition(
             "A cycle is detected while visiting instruction %s",
             current_node->ToString());
@@ -2867,6 +3148,7 @@ static Status PostOrderDFS(HloInstruction* root, Visitor* visitor,
     if (!ignore_control_predecessors) {
       for (HloInstruction* child : current_node->control_predecessors()) {
         if (!TF_PREDICT_TRUE(PushDFSChild(visitor, &dfs_stack, child))) {
+          PrintCycle(child, &dfs_stack);
           return FailedPrecondition(
               "A cycle is detected while visiting instruction %s",
               current_node->ToString());
@@ -2926,23 +3208,11 @@ Status HloInstruction::AcceptWithOperandOrder(
   return Status::OK();
 }
 
-Status HloInstruction::Accept(
-    const std::function<Status(HloInstruction*)>& visitor_func) {
-  FunctionVisitor visitor(visitor_func);
-  return this->Accept(&visitor);
-}
-
-Status HloInstruction::Accept(
-    const std::function<Status(const HloInstruction*)>& visitor_func) const {
-  ConstFunctionVisitor visitor(visitor_func);
-  return this->Accept(&visitor);
-}
-
 const Shape& HloInstruction::shape() const { return shape_; }
 
-std::vector<int64> HloInstruction::OperandIndices(
+absl::InlinedVector<int64, 4> HloInstruction::OperandIndices(
     const HloInstruction* operand) const {
-  std::vector<int64> result;
+  absl::InlinedVector<int64, 4> result;
   for (int64 i = 0; i < operand_count(); ++i) {
     if (this->operand(i) == operand) {
       result.push_back(i);
@@ -2988,7 +3258,7 @@ class HloInstruction::FusionReusesParamElements {
       }
     }
 
-    auto p = cache->emplace(&hlo, UseKind{});
+    auto p = cache->emplace(&hlo, UseKind::kNoUse);
     auto value_it = p.first;
     const bool key_is_new = p.second;
 
@@ -2998,8 +3268,9 @@ class HloInstruction::FusionReusesParamElements {
 
         // The next operation invalidates iterators.
         UseKind new_val =
-            Plus(old_val, std::min(hlo.OperandElementUse(j),
-                                   ComputeInternal(i, *hlo.operand(j), cache)));
+            Fold(old_val,
+                 FoldUseMandatory(hlo.OperandElementUse(j),
+                                  ComputeInternal(i, *hlo.operand(j), cache)));
 
         // Re-acquire the iterator. We could work harder to do this only if
         // absolutely necessary, but this code is not hot enough to warrant
@@ -3011,21 +3282,61 @@ class HloInstruction::FusionReusesParamElements {
     return value_it->second;
   }
 
-  // Fold operation for UseKinds.
-  static UseKind Plus(UseKind a, UseKind b) {
-    if (a == UseKind::kNoUse) {
-      return b;
-    } else if (b == UseKind::kNoUse) {
-      return a;
-    } else if (a == UseKind::kReuse || b == UseKind::kReuse) {
-      return UseKind::kReuse;
-    } else if (a == UseKind::kUsePermutingElements ||
-               b == UseKind::kUsePermutingElements) {
-      return UseKind::kReuse;
-    } else {
-      CHECK(a == UseKind::kUse && b == UseKind::kUse);
-      return UseKind::kUse;
+  // Combines two UseKinds.
+  //
+  // This is the min operation on the lattice
+  //
+  //   kReuse < kUse < kNoUse.
+  //
+  // Two kUses uses which have different permutations count as kReuse.
+  static UseKind Fold(UseKind a, UseKind b) {
+    // Without loss of generality, let `b` be the operation with the larger use
+    // kind.
+    if (b.kind < a.kind) {
+      std::swap(a, b);
     }
+    // If the kinds are different, return the smaller one, namely `a`.
+    if (a.kind != b.kind) {
+      return a;
+    }
+    // If the kinds are both kUse, check that they're the same permutation.
+    if (a.kind == UseKind::kUse && b.kind == UseKind::kUse &&
+        a.permutation_instr != b.permutation_instr) {
+      return UseKind::kReuse;
+    }
+    return a;  // They're the same.
+  }
+
+  // Combines two UseKinds differently than Fold().
+  //
+  // This is the min operation on the lattice
+  //
+  //   kNoUse < kReuse < kUse.
+  //
+  // If `a` and `b` are both kUse and one has a non-null permutation
+  // instruction, returns kUse with that permutation.  OTOH if both have
+  // different, non-null permutation instructions, returns kReuse.
+  //
+  // You can think of this sort of as a conjunction, whereas Fold is sort of a
+  // disjunction.  FoldUseMandatory() says "no use" if either input isn't used,
+  // whereas Fold() would say "use".
+  static UseKind FoldUseMandatory(UseKind a, UseKind b) {
+    if (a.kind == UseKind::kNoUse || b.kind == UseKind::kNoUse) {
+      return UseKind::kNoUse;
+    }
+    if (a.kind == UseKind::kReuse || b.kind == UseKind::kReuse) {
+      return UseKind::kReuse;
+    }
+    if (a.permutation_instr == b.permutation_instr) {
+      return a;  // They're the same.
+    }
+    if (b.permutation_instr == nullptr) {
+      return a;
+    }
+    if (a.permutation_instr == nullptr) {
+      return b;
+    }
+    return UseKind::kReuse;
   }
 };
 
@@ -3033,20 +3344,27 @@ HloInstruction::UseKind HloInstruction::OperandElementUse(
     int64 operand_num) const {
   switch (opcode_) {
     case HloOpcode::kBitcast:
+      // A bitcast that only adds or removes degenerate (i.e. size 1) dimensions
+      // doesn't permute its elements, so it counts as a plain, non-permuting
+      // use.
+      return ShapeUtil::DropDegenerateDimensions(shape()) ==
+                     ShapeUtil::DropDegenerateDimensions(operand(0)->shape())
+                 ? UseKind::kUse
+                 : UseKind::Permuting(this);
     case HloOpcode::kConcatenate:
     case HloOpcode::kReshape:
     case HloOpcode::kReverse:
     case HloOpcode::kSlice:
     case HloOpcode::kTranspose:
-      return UseKind::kUsePermutingElements;
+      return UseKind::Permuting(this);
     case HloOpcode::kPad:
       // Pad reuses the padding value but not the padded array elements.
-      return operand_num > 0 ? UseKind::kReuse : UseKind::kUsePermutingElements;
+      return operand_num > 0 ? UseKind::kReuse : UseKind::Permuting(this);
     case HloOpcode::kReduce:
       // Reduce reuses the init values but not the operand array elements.
       return operand_num >= Cast<HloReduceInstruction>(this)->input_count()
                  ? UseKind::kReuse
-                 : UseKind::kUsePermutingElements;
+                 : UseKind::Permuting(this);
     case HloOpcode::kFusion:
       // Uses the memoizing, recursive computation defined above.
       return FusionReusesParamElements::Compute(operand_num,
@@ -3066,6 +3384,10 @@ HloInstruction::UseKind HloInstruction::OperandElementUse(
         return UseKind::kUse;
       }
       return UseKind::kReuse;
+    case HloOpcode::kGather:
+      // Gather reads its indices in a linear fashion, and it permutes the
+      // vector it's gathering from.
+      return operand_num == 0 ? UseKind::kUse : UseKind::Permuting(this);
     default:
       return IsElementwise() ? UseKind::kUse : UseKind::kReuse;
   }
@@ -3110,6 +3432,21 @@ StatusOr<HloInstruction::FusionKind> StringToFusionKind(
   return InvalidArgument("Unknown fusion kind: %s", kind_name);
 }
 
+string FrontendAttributesToString(
+    const FrontendAttributes& frontend_attributes) {
+  std::vector<std::pair<string, string>> sorted_attributes(
+      frontend_attributes.map().begin(), frontend_attributes.map().end());
+  absl::c_sort(sorted_attributes);
+  // Frontend attribute is a comma-separated list of attribute="value" pairs,
+  // e.g., frontend_attributes={name="value_a",type="int32"}.
+  const auto formatter = [](string* out,
+                            const std::pair<string, string>& item) {
+    absl::StrAppend(out, item.first, "=\"", item.second, "\"");
+  };
+  return absl::StrFormat("{%s}",
+                         absl::StrJoin(sorted_attributes, ",", formatter));
+}
+
 string PaddingConfigToString(const PaddingConfig& padding) {
   bool has_interior_padding =
       absl::c_any_of(padding.dimensions(),
@@ -3145,6 +3482,9 @@ string OpMetadataToString(const OpMetadata& metadata) {
 
 string RandomDistributionToString(const RandomDistribution& distribution) {
   return absl::AsciiStrToLower(RandomDistribution_Name(distribution));
+}
+string RandomAlgorithmToString(const RandomAlgorithm& algorithm) {
+  return absl::AsciiStrToLower(RandomAlgorithm_Name(algorithm));
 }
 
 string PrecisionToString(const PrecisionConfig::Precision& precision) {
@@ -3188,6 +3528,24 @@ string ReplicaGroupsToString(const std::vector<ReplicaGroup>& replica_groups) {
         StrCat("{", StrJoin(group.replica_ids(), ","), "}"));
   }
   return StrCat("{", StrJoin(replica_group_str, ","), "}");
+}
+
+StatusOr<RandomAlgorithm> StringToRandomAlgorithm(const string& name) {
+  static std::unordered_map<string, RandomAlgorithm>* map = [] {
+    static auto* map = new std::unordered_map<string, RandomAlgorithm>;
+    for (int i = 0; i < RandomAlgorithm_ARRAYSIZE; i++) {
+      if (RandomAlgorithm_IsValid(i)) {
+        auto value = static_cast<RandomAlgorithm>(i);
+        (*map)[RandomAlgorithmToString(value)] = value;
+      }
+    }
+    return map;
+  }();
+  auto found = map->find(absl::AsciiStrToLower(name));
+  if (found == map->end()) {
+    return InvalidArgument("Unknown algorithm");
+  }
+  return found->second;
 }
 
 StatusOr<RandomDistribution> StringToRandomDistribution(const string& name) {
@@ -3249,17 +3607,6 @@ bool HloPtrComparator::operator()(const HloInstruction* const& lhs,
     return lhs_module->unique_id() < rhs_module->unique_id();
   }
   return lhs->unique_id() < rhs->unique_id();
-}
-
-bool HloInstruction::CouldBeBitcast() const {
-  switch (opcode_) {
-    case HloOpcode::kTranspose:
-      return true;
-    case HloOpcode::kReshape:
-      return std::get<0>(ReshapeMerelyInsertsOrDeletes1SizedDimensions());
-    default:
-      return false;
-  }
 }
 
 Status HloInstruction::GetBackendConfigInternal(
@@ -3346,16 +3693,19 @@ const std::vector<int64>& HloInstruction::fft_length() const {
   return Cast<HloFftInstruction>(this)->fft_length();
 }
 
-int64 HloInstruction::channel_id() const {
-  return Cast<HloSendRecvInstruction>(this)->channel_id();
-}
-
 int64 HloInstruction::concatenate_dimension() const {
   return Cast<HloConcatenateInstruction>(this)->concatenate_dimension();
 }
 
 int64 HloInstruction::dimension() const {
+  if (auto set_size = DynCast<HloSetDimensionSizeInstruction>(this)) {
+    return set_size->dimension();
+  }
   return Cast<HloGetDimensionSizeInstruction>(this)->dimension();
+}
+
+int64 HloInstruction::inferred_dimension() const {
+  return Cast<HloReshapeInstruction>(this)->inferred_dimension();
 }
 
 bool HloInstruction::IsRank2Transpose() const {
@@ -3371,6 +3721,10 @@ const std::vector<int64>& HloInstruction::slice_starts() const {
   return Cast<HloSliceInstruction>(this)->slice_starts();
 }
 
+std::vector<int64>* HloInstruction::mutable_slice_starts() {
+  return Cast<HloSliceInstruction>(this)->mutable_slice_starts();
+}
+
 int64 HloInstruction::slice_limits(int64 dimension) const {
   return Cast<HloSliceInstruction>(this)->slice_limits(dimension);
 }
@@ -3379,12 +3733,20 @@ const std::vector<int64>& HloInstruction::slice_limits() const {
   return Cast<HloSliceInstruction>(this)->slice_limits();
 }
 
+std::vector<int64>* HloInstruction::mutable_slice_limits() {
+  return Cast<HloSliceInstruction>(this)->mutable_slice_limits();
+}
+
 int64 HloInstruction::slice_strides(int64 dimension) const {
   return Cast<HloSliceInstruction>(this)->slice_strides(dimension);
 }
 
 const std::vector<int64>& HloInstruction::slice_strides() const {
   return Cast<HloSliceInstruction>(this)->slice_strides();
+}
+
+std::vector<int64>* HloInstruction::mutable_slice_strides() {
+  return Cast<HloSliceInstruction>(this)->mutable_slice_strides();
 }
 
 const Literal& HloInstruction::literal() const {
@@ -3549,21 +3911,12 @@ HloInstruction::source_target_pairs() const {
   return Cast<HloCollectivePermuteInstruction>(this)->source_target_pairs();
 }
 
-string HloInstruction::all_reduce_barrier() const {
-  return Cast<HloAllReduceInstruction>(this)->all_reduce_barrier();
+absl::optional<int64> HloInstruction::channel_id() const {
+  return Cast<HloChannelInstruction>(this)->channel_id();
 }
 
-void HloInstruction::set_all_reduce_barrier(const string& barrier) {
-  return Cast<HloAllReduceInstruction>(this)->set_all_reduce_barrier(barrier);
-}
-
-absl::optional<int64> HloInstruction::all_reduce_id() const {
-  return Cast<HloAllReduceInstruction>(this)->all_reduce_id();
-}
-
-void HloInstruction::set_all_reduce_id(
-    const absl::optional<int64>& all_reduce_id) {
-  return Cast<HloAllReduceInstruction>(this)->set_all_reduce_id(all_reduce_id);
+void HloInstruction::set_channel_id(const absl::optional<int64>& channel_id) {
+  return Cast<HloChannelInstruction>(this)->set_channel_id(channel_id);
 }
 
 const ConvolutionDimensionNumbers&
@@ -3596,6 +3949,9 @@ int64 HloInstruction::feature_group_count() const {
 }
 
 void HloInstruction::set_feature_group_count(int64 feature_group_count) {
+  if (auto convolution = DynCast<HloConvolutionInstruction>(this)) {
+    return convolution->set_feature_group_count(feature_group_count);
+  }
   Cast<HloCustomCallInstruction>(this)->set_feature_group_count(
       feature_group_count);
 }
@@ -3608,6 +3964,9 @@ int64 HloInstruction::batch_group_count() const {
 }
 
 void HloInstruction::set_batch_group_count(int64 batch_group_count) {
+  if (auto convolution = DynCast<HloConvolutionInstruction>(this)) {
+    return convolution->set_batch_group_count(batch_group_count);
+  }
   Cast<HloCustomCallInstruction>(this)->set_batch_group_count(
       batch_group_count);
 }
@@ -3634,6 +3993,10 @@ const string& HloInstruction::custom_call_target() const {
 
 const PaddingConfig& HloInstruction::padding_config() const {
   return Cast<HloPadInstruction>(this)->padding_config();
+}
+
+PaddingConfig* HloInstruction::mutable_padding_config() {
+  return Cast<HloPadInstruction>(this)->mutable_padding_config();
 }
 
 int64 HloInstruction::slice_sizes(int64 dimension) const {

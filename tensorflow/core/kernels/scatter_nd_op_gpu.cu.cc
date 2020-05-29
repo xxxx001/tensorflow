@@ -64,7 +64,7 @@ struct LeftUpdate<std::complex<T>, scatter_nd_op::UpdateOp::ADD> {
       std::complex<T>* out, const std::complex<T>& val) {
     T* ptr = reinterpret_cast<T*>(out);
     GpuAtomicAdd(ptr, val.real());
-    GpuAtomicAdd(ptr, val.imag());
+    GpuAtomicAdd(ptr + 1, val.imag());
   }
 };
 
@@ -72,7 +72,9 @@ template <typename T>
 struct LeftUpdate<std::complex<T>, scatter_nd_op::UpdateOp::SUB> {
   EIGEN_STRONG_INLINE EIGEN_DEVICE_FUNC void operator()(
       std::complex<T>* out, const std::complex<T>& val) {
-    LeftUpdate<std::complex<T>, scatter_nd_op::UpdateOp::ADD>()(out, -val);
+    T* ptr = reinterpret_cast<T*>(out);
+    GpuAtomicSub(ptr, val.real());
+    GpuAtomicSub(ptr + 1, val.imag());
   }
 };
 
@@ -171,6 +173,7 @@ struct ScatterNdFunctor<GPUDevice, T, Index, op, IXDIM> {
   DECLARE_GPU_SPECS_INDEX(T, int64)
 
 TF_CALL_int32(DECLARE_GPU_SPECS);
+TF_CALL_int64(DECLARE_GPU_SPECS);
 TF_CALL_GPU_NUMBER_TYPES(DECLARE_GPU_SPECS);
 TF_CALL_complex64(DECLARE_GPU_SPECS);
 TF_CALL_complex128(DECLARE_GPU_SPECS);
